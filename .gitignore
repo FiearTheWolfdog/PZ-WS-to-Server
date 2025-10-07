@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtual envs
+.venv/
+venv/
+.env/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# VS Code local settings (keep tasks and settings tracked if desired)
+# .vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# App runtime data (generated at use time)
+WorkshopIDs.txt
+ModIDs.txt
+WorkshopMeta.json
+Collections.json
+Settings.json
+
+# Logs/Temp
+*.log
+*.tmp

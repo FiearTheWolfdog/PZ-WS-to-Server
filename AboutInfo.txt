@@ -1,0 +1,8 @@
+Herro! FIEARtheWolfdog here!
+
+I wanted to create this because I was going to set up a server for my friends and me, and on AMP, I noticed that it wanted all of the Workshop Mod IDs and Workshop IDs, which, when it comes to PZ servers, could take hours due to a lot of servers adding a few hundred mods. So I created this program! This allows you to simply copy the link of the Workshop Item or Collection you wish and paste it in the app, and the app will do the rest for you! No more looking through every description and finding the IDs you need!
+
+If there is anything you think I could do to improve this, please let me know!!
+Discord: FIEAR
+Telegram: https://t.me/fiearthewolfdog
+https://buymeacoffee.com/FIEARtheWolfdog

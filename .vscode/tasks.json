@@ -1,0 +1,144 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run PZ mod scraper (interactive)",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"f:/SMNotes/PZ WS to Server/pz_mod_scraper.py"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "none"
+		},
+		{
+			"label": "Run PZ mod scraper (single URL)",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"f:/SMNotes/PZ WS to Server/pz_mod_scraper.py",
+				"https://steamcommunity.com/sharedfiles/filedetails/?id=2847184718"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "none"
+		},
+		{
+			"label": "Run PZ mod scraper (GUI)",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"f:/SMNotes/PZ WS to Server/pz_mod_scraper.py",
+				"--gui"
+			],
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "none"
+		},
+		{
+			"label": "Run PZ mod scraper (GUI, details)",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"f:/SMNotes/PZ WS to Server/pz_mod_scraper.py",
+				"--gui"
+			],
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "none"
+		},
+		{
+			"label": "Run PZ mod scraper (GUI with new features)",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"f:/SMNotes/PZ WS to Server/pz_mod_scraper.py",
+				"--gui"
+			],
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "none"
+		},
+		{
+			"label": "Run PZ mod scraper (GUI remove-mods)",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"f:/SMNotes/PZ WS to Server/pz_mod_scraper.py",
+				"--gui"
+			],
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "none"
+		},
+		{
+			"label": "Run PZ mod scraper (GUI with menu/dark mode)",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"f:/SMNotes/PZ WS to Server/pz_mod_scraper.py",
+				"--gui"
+			],
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "none"
+		},
+		{
+			"label": "Build one-file EXE (PyInstaller)",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				"build.ps1"
+			],
+			"problemMatcher": [
+				"$msCompile"
+			]
+		},
+		{
+			"label": "Build one-file EXE (PyInstaller)",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				"build.ps1"
+			],
+			"problemMatcher": [
+				"$msCompile"
+			]
+		},
+		{
+			"label": "Build one-file EXE (PyInstaller)",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				"build.ps1"
+			],
+			"problemMatcher": [
+				"$msCompile"
+			]
+		},
+		{
+			"label": "Build one-file EXE (PyInstaller)",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				"build.ps1"
+			],
+			"problemMatcher": [
+				"$msCompile"
+			]
+		}
+	]
+}
