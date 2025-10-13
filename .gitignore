@@ -32,3 +32,6 @@ Settings.json
 # Logs/Temp
 *.log
 *.tmp
+
+# Local test artifacts
+Test folder/
