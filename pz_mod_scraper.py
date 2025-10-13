@@ -34,6 +34,11 @@ import webbrowser
 # GUI imports (standard library)
 import tkinter as tk
 from tkinter import ttk, messagebox
+import tkinter.font as tkfont
+
+
+# Application version
+VERSION = "V.0.1.5+build.20251012"
 
 
 # App directory (next to the EXE when frozen, next to the .py when running from source)
@@ -352,25 +357,44 @@ def get_meta_for_workshop_id(wsid: str) -> Dict[str, str]:
 
 
 def parse_required_wsids_from_html(html_text: str, hint_section: bool = True) -> List[str]:
-    """Extract required workshop IDs from the Workshop page HTML.
+    """Extract required workshop IDs only from the 'REQUIRED ITEMS' section.
 
-    Strategy:
-      - Prefer links under a section that mentions "Required" (e.g., "Required items").
-      - Fallback to scanning whole page for sharedfiles/filedetails links.
+    Behavior:
+      - Locate the header text 'REQUIRED ITEMS' (case-insensitive).
+      - Extract workshop IDs from the content that follows this header only.
+      - Stop before the next major section header (e.g., 'OPTIONAL ITEMS') when present.
+      - Do not fall back to scanning the whole page.
     """
-    ids: List[str] = []
     def extract_ids(text: str) -> List[str]:
-        return re.findall(r"sharedfiles/fil[e]?details/\?id=(\d+)", text, flags=re.IGNORECASE)
+        found: List[str] = []
+        # Common link patterns
+        found += re.findall(r"(?:sharedfiles|workshop)/filedetails/\?id=(\d+)", text, flags=re.IGNORECASE)
+        found += re.findall(r"filedetails/\?id=(\d+)", text, flags=re.IGNORECASE)
+        # Attribute-based patterns that often appear in dependency widgets
+        found += re.findall(r"data-publishedfileid=\"(\d+)\"", text, flags=re.IGNORECASE)
+        # JSON-embedded forms (both quoted and unquoted, allow escaped quotes)
+        found += re.findall(r"publishedfileid\"?\\?\"?\s*[:=]\s*\"?(\d+)\"?", text, flags=re.IGNORECASE)
+        # Encoded linkfilter or query params (id%3D12345)
+        found += re.findall(r"id%3D(\d+)", text, flags=re.IGNORECASE)
+        # childpublishedfileid params sometimes appear on workshop pages
+        found += re.findall(r"childpublishedfileid=([0-9]+)", text, flags=re.IGNORECASE)
+        found += re.findall(r"childpublishedfileid%5B%5D=([0-9]+)", text, flags=re.IGNORECASE)
+        return found
 
     text = html.unescape(html_text)
-    if hint_section:
-        # Look for a window around the phrase "Required" to limit noise
-        for m in re.finditer(r"Required\s+(items|mods?)", text, flags=re.IGNORECASE):
-            start = max(0, m.start() - 200)
-            chunk = text[start:start + 4000]  # scan ahead ~4KB
-            ids.extend(extract_ids(chunk))
-    if not ids:
-        ids = extract_ids(text)
+    ids: List[str] = []
+    # Find the 'REQUIRED ITEMS' header
+    for m in re.finditer(r"REQUIRED\s+ITEMS", text, flags=re.IGNORECASE):
+        start = m.end()
+        # Determine an end boundary: before the next header like 'OPTIONAL ITEMS' or a reasonable slice
+        next_optional = re.search(r"OPTIONAL\s+ITEMS", text[start:start + 20000], flags=re.IGNORECASE)
+        if next_optional:
+            end = start + next_optional.start()
+        else:
+            end = min(len(text), start + 20000)
+        chunk = text[start:end]
+        ids.extend(extract_ids(chunk))
+
     # Dedupe preserving order
     seen: Set[str] = set()
     out: List[str] = []
@@ -382,12 +406,15 @@ def parse_required_wsids_from_html(html_text: str, hint_section: bool = True) ->
 
 
 def get_required_wsids(wsid: str) -> List[str]:
-    url = f"https://steamcommunity.com/sharedfiles/filedetails/?id={wsid}"
+    # Force English locale to stabilize 'Required items' phrasing across languages
+    url = f"https://steamcommunity.com/sharedfiles/filedetails/?id={wsid}&l=english"
     try:
         html_text = fetch_html(url)
     except FetchError:
         return []
-    return parse_required_wsids_from_html(html_text)
+    ids = parse_required_wsids_from_html(html_text)
+    # Drop self id if present
+    return [i for i in ids if i != wsid]
 
 
 def parse_tags_from_html(html_text: str) -> List[str]:
@@ -553,7 +580,29 @@ def build_gui():
     load_existing_to_memory()
 
     root = tk.Tk()
-    root.title("PZ Workshop/Mod ID Builder")
+    root.title(f"PZ Workshop/Mod ID Builder — {VERSION}")
+
+    # Apply global font across all widgets (named Tk fonts)
+    def _apply_global_font(family: str = "Tahoma", size: int = 10) -> None:
+        font_names = (
+            "TkDefaultFont",
+            "TkTextFont",
+            "TkFixedFont",
+            "TkMenuFont",
+            "TkHeadingFont",
+            "TkCaptionFont",
+            "TkSmallCaptionFont",
+            "TkTooltipFont",
+        )
+        for name in font_names:
+            try:
+                f = tkfont.nametofont(name)
+                f.configure(family=family, size=size)
+            except Exception:
+                # Some platforms/themes may not define all named fonts
+                continue
+
+    _apply_global_font()
     root.geometry("900x520")
     root.resizable(True, True)
 
@@ -668,6 +717,11 @@ def build_gui():
         dlg.grab_set()
         frm = ttk.Frame(dlg, padding=10)
         frm.pack(fill=tk.BOTH, expand=True)
+        # Show app version at the top of the Info dialog
+        try:
+            ttk.Label(frm, text=f"Version: {VERSION}").pack(anchor="w")
+        except Exception:
+            pass
         txt = tk.Text(frm, height=14, wrap="word", state="disabled")
         # Theme text widget roughly to match mode
         try:
@@ -734,33 +788,68 @@ def build_gui():
     url_entry.grid(row=0, column=1, sticky="ew", padx=(8, 8))
     url_entry.focus_set()
 
-    # Reusable dialog to choose a single Mod ID when multiple are present
-    def choose_mod_id_dialog(options: List[str]) -> Optional[str]:
+    # Reusable dialog to choose one or more Mod IDs when multiple are present
+    def choose_mod_ids_dialog(options: List[str]) -> List[str]:
         if not options:
-            return None
-        sel: List[Optional[str]] = [options[0]]
+            return []
         win = tk.Toplevel(root)
-        win.title("Select Mod ID")
+        win.title("Select Mod IDs")
         win.transient(root)
         win.grab_set()
-        ttk.Label(win, text="Multiple Mod IDs found. Select one to add:").pack(anchor="w", padx=10, pady=(10, 6))
-        var = tk.StringVar(value=options[0])
-        frame = ttk.Frame(win)
-        frame.pack(fill=tk.BOTH, expand=True, padx=10)
+        ttk.Label(win, text="Multiple Mod IDs found. Select one or more to add:").pack(anchor="w", padx=10, pady=(10, 6))
+
+        # Scrollable area with checkboxes
+        outer = ttk.Frame(win)
+        outer.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def on_cfg(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfig(inner_id, width=canvas.winfo_width())
+        inner.bind("<Configure>", on_cfg)
+
+        vars: Dict[str, tk.IntVar] = {}
+        # Default: pre-select all
         for opt in options:
-            ttk.Radiobutton(frame, text=opt, value=opt, variable=var).pack(anchor="w")
+            v = tk.IntVar(value=1)
+            vars[opt] = v
+            ttk.Checkbutton(inner, text=opt, variable=v).pack(anchor="w")
+
+        # Controls
+        ctrl = ttk.Frame(win)
+        ctrl.pack(fill=tk.X, padx=10, pady=(4, 10))
+        def select_all():
+            for v in vars.values():
+                v.set(1)
+        def deselect_all():
+            for v in vars.values():
+                v.set(0)
+        ttk.Button(ctrl, text="Select All", command=select_all).pack(side=tk.LEFT)
+        ttk.Button(ctrl, text="Deselect All", command=deselect_all).pack(side=tk.LEFT, padx=(6,0))
+
+        # OK button
         btns = ttk.Frame(win)
-        btns.pack(fill=tk.X, pady=10)
+        btns.pack(fill=tk.X)
+        selected: List[str] = []
         def on_ok():
-            sel[0] = var.get()
+            selected.clear()
+            selected.extend([opt for opt, v in vars.items() if v.get()])
             win.destroy()
-        ttk.Button(btns, text="OK", command=on_ok).pack(side=tk.RIGHT, padx=(0,10))
-        # If the user clicks the window close [X], treat it like OK to avoid empty selection
+        ttk.Button(btns, text="Add Selected", command=on_ok).pack(side=tk.RIGHT, padx=(0,10))
+        # Close acts like cancel (keep current selection state)
         win.protocol("WM_DELETE_WINDOW", on_ok)
         win.update_idletasks()
-        win.geometry(f"400x{min(200, 80 + 24*len(options))}")
+        # Heuristic height based on option count
+        height = min(360, 140 + 22*len(options))
+        win.geometry(f"420x{height}")
         win.wait_window()
-        return sel[0]
+        return selected
 
     def on_add_clicked(*_):
         url = url_var.get().strip().strip('"')
@@ -790,11 +879,11 @@ def build_gui():
                         skipped_total += 1
                         continue
                     meta = get_meta_for_workshop_id(wid)
-                    # If multiple Mod IDs, prompt user to choose one
+                    # If multiple Mod IDs, prompt user to choose one or more
                     rmods = meta.get("mods", []) if isinstance(meta, dict) else []
                     if isinstance(rmods, list) and len(rmods) > 1:
-                        chosen_mid = choose_mod_id_dialog(rmods)
-                        rmods = [chosen_mid] if chosen_mid else []
+                        chosen_mids = choose_mod_ids_dialog(rmods)
+                        rmods = chosen_mids
                     ensure_in_list(workshop_ids, [wid])
                     workshop_meta[wid] = meta
                     added = ensure_in_list(mod_ids, rmods)
@@ -835,13 +924,10 @@ def build_gui():
             return
         wsid, mods = process_url(url)
 
-        # If multiple Mod IDs found, ask the user to select exactly one
+        # If multiple Mod IDs found, ask the user to select one or more
         if len(mods) > 1:
-            chosen = choose_mod_id_dialog(mods)
-            if chosen:
-                mods = [chosen]
-            else:
-                mods = []
+            chosen = choose_mod_ids_dialog(mods)
+            mods = chosen
         added_ws = ensure_in_list(workshop_ids, [wsid] if wsid else [])
         added_mods = ensure_in_list(mod_ids, mods)
 
@@ -883,36 +969,262 @@ def build_gui():
                 pass
             threading.Thread(target=fetch_and_update_one, args=(wsid,), daemon=True).start()
 
-            # Auto-add required workshops in the background
-            def add_requirements(root_wsid: str):
-                reqs = get_required_wsids(root_wsid)
-                added_count = 0
-                skipped_count = 0
-                for rid in reqs:
-                    if rid in workshop_ids:
+            # Prompt to add required workshops instead of auto-adding
+            def gather_requirements(root_wsid: str):
+                # Recursively discover required items (transitive), but only list items that expose Mod IDs.
+                # Also track which parent mods require them to display provenance ("Required by").
+                try:
+                    root_meta = get_meta_for_workshop_id(root_wsid)
+                except Exception:
+                    root_meta = {"title": f"Workshop {root_wsid}"}
+
+                visited: Set[str] = set()
+                parent_map: Dict[str, Set[str]] = {}  # child -> set(parents)
+                meta_map: Dict[str, Dict[str, Any]] = {}
+                order: List[str] = []  # insertion order of discovered children
+
+                def ensure_parent(child: str, parent: str):
+                    s = parent_map.get(child)
+                    if s is None:
+                        s = set()
+                        parent_map[child] = s
+                    before = len(s)
+                    s.add(parent)
+                    if before == 0:
+                        order.append(child)
+
+                # BFS with depth cap for safety
+                from collections import deque
+                max_depth = 3
+                max_nodes = 120
+                q = deque()
+
+                # Seed with first-level requirements
+                try:
+                    first_level = get_required_wsids(root_wsid)
+                except Exception:
+                    first_level = []
+                for rid in first_level:
+                    ensure_parent(rid, root_wsid)
+                    q.append((rid, 1))
+
+                while q and len(visited) < max_nodes:
+                    cur, depth = q.popleft()
+                    if cur in visited:
                         continue
-                    # Fetch metadata and mods first
-                    meta = get_meta_for_workshop_id(rid)
-                    rmods = meta.get("mods", []) if isinstance(meta, dict) else []
+                    visited.add(cur)
+                    # Fetch meta (title/mod ids) for current
+                    try:
+                        meta_map[cur] = get_meta_for_workshop_id(cur)
+                    except Exception:
+                        meta_map[cur] = {"title": f"Workshop {cur}", "mods": []}
+                    # Traverse deeper if depth allows
+                    if depth < max_depth:
+                        try:
+                            children = get_required_wsids(cur)
+                        except Exception:
+                            children = []
+                        for ch in children:
+                            ensure_parent(ch, cur)
+                            if ch not in visited:
+                                q.append((ch, depth + 1))
+
+                # Build dialog items: only include those with Mod IDs
+                items: List[Dict[str, Any]] = []
+                for rid in order:
+                    meta = meta_map.get(rid) or {}
+                    rmods = (meta or {}).get("mods", [])
                     if not rmods:
-                        skipped_count += 1
-                        continue  # skip adding required workshop if no Mod ID is found
-                    # Add required workshop ID and its mods
-                    ensure_in_list(workshop_ids, [rid])
-                    workshop_meta[rid] = meta
-                    ensure_in_list(mod_ids, rmods)
-                    added_count += 1
-                    # Update UI row for this dependency
-                    root.after(0, lambda r=rid, m=meta: upsert_tree_item(r, m))
-                # Persist updates and report summary
-                def finalize():
+                        # Keep for traversal but do not list selectable item
+                        continue
+                    title = (meta or {}).get("title") or f"Workshop {rid}"
+                    # Build 'Required by' titles from parents
+                    parents = list(parent_map.get(rid, set()))
+                    parent_titles: List[str] = []
+                    for p in parents:
+                        if p == root_wsid:
+                            parent_titles.append(root_meta.get("title") or f"Workshop {p}")
+                        else:
+                            pm = meta_map.get(p) or {}
+                            parent_titles.append(pm.get("title") or f"Workshop {p}")
+                    items.append({
+                        "wsid": rid,
+                        "title": title,
+                        "link": f"https://steamcommunity.com/sharedfiles/filedetails/?id={rid}",
+                        "mods": rmods,
+                        "meta": meta or {"url": f"https://steamcommunity.com/sharedfiles/filedetails/?id={rid}"},
+                        "required_by": parent_titles,
+                    })
+
+                def show_dialog():
+                    try:
+                        if not items:
+                            # No dependencies found — avoid popup; update status bar quietly
+                            try:
+                                status_var.set(f"No required items for this workshop item. added {added_mods} mods")
+                            except Exception:
+                                pass
+                            return
+
+                        dlg = tk.Toplevel(root)
+                        dlg.title("Select Required Mods to Add")
+                        dlg.transient(root)
+                        dlg.grab_set()
+
+                        container = ttk.Frame(dlg, padding=10)
+                        container.pack(fill=tk.BOTH, expand=True)
+
+                        # Explanatory text
+                        _info_txt = (
+                            "The mod(s) listed were found to be either Required or Optional for the mod you added. "
+                            "If you think the mod is needed, add it. Do some testing. If you need this list again, "
+                            "remove the parent mod and paste again like normal."
+                        )
+                        ttk.Label(container, text=_info_txt, wraplength=620, justify="left").pack(anchor="w", pady=(0,8))
+
+                        # Instructions with count (after filtering)
+                        ttk.Label(container, text=f"This item has {len(items)} required mod(s) (including transitive). Select which ones to add:").pack(anchor="w", pady=(0,8))
+
+                        # Buttons row
+                        btns = ttk.Frame(container)
+                        btns.pack(fill=tk.X, pady=(0,8))
+
+                        # Scrollable list (use classic Tk widgets for reliable rendering inside Canvas)
+                        bg = "#1e1e1e" if dark_mode.get() else "#ffffff"
+                        fg = "#e0e0e0" if dark_mode.get() else "#000000"
+                        canvas = tk.Canvas(container, highlightthickness=0, background=bg)
+                        vsb = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+                        list_frame = tk.Frame(canvas, background=bg)
+                        list_frame_id = canvas.create_window((0, 0), window=list_frame, anchor="nw")
+                        canvas.configure(yscrollcommand=vsb.set)
+                        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+                        def on_configure(event=None):
+                            try:
+                                canvas.itemconfig(list_frame_id, width=canvas.winfo_width())
+                                canvas.configure(scrollregion=canvas.bbox("all"))
+                            except Exception:
+                                pass
+                        list_frame.bind("<Configure>", on_configure)
+                        canvas.bind("<Configure>", on_configure)
+                        # Also nudge layout once after idle to ensure items appear without scroll interaction
+                        root.after_idle(lambda: on_configure())
+
+                        checks: Dict[str, tk.IntVar] = {}
+
+                        def open_link(url: str):
+                            # Prefer opening in Steam client; fallback to default browser if scheme is not handled
+                            steam_url = f"steam://openurl/{url}"
+                            try:
+                                if not webbrowser.open(steam_url, new=2):
+                                    raise RuntimeError("steam protocol not handled")
+                            except Exception:
+                                try:
+                                    webbrowser.open(url, new=2)
+                                except Exception:
+                                    pass
+
+                        # Build rows
+                        for it in items:
+                            row = tk.Frame(list_frame, background=bg)
+                            row.pack(fill=tk.X, pady=4)
+                            var = tk.IntVar(value=1 if it.get("mods") else 0)
+                            checks[it["wsid"]] = var
+                            tk.Checkbutton(row, variable=var, background=bg, activebackground=bg).pack(side=tk.LEFT, padx=(0,6))
+                            title_text = it["title"]
+                            # Append provenance info if available
+                            rby = it.get("required_by") or []
+                            if rby:
+                                # Limit to a few names to avoid overly long rows
+                                show_list = ", ".join(rby[:3]) + ("…" if len(rby) > 3 else "")
+                                title_text += f" — Required by: {show_list}"
+                            if not it.get("mods"):
+                                title_text += " (no Mod IDs found)"
+                            tk.Label(row, text=title_text, background=bg, foreground=fg).pack(side=tk.LEFT, padx=(0,8))
+                            link = it["link"]
+                            ttk.Button(row, text="Open Steam", command=lambda u=link: open_link(u)).pack(side=tk.LEFT)
+
+                        # Ensure scrollregion reflects populated content and start at top
+                        try:
+                            list_frame.update_idletasks()
+                            canvas.configure(scrollregion=canvas.bbox("all"))
+                            canvas.yview_moveto(0)
+                        except Exception:
+                            pass
+
+                        def select_all():
+                            for rid, v in checks.items():
+                                it = next((x for x in items if x["wsid"] == rid), None)
+                                if it and it.get("mods"):
+                                    v.set(1)
+                        def deselect_all():
+                            for v in checks.values():
+                                v.set(0)
+                        ttk.Button(btns, text="Select All", command=select_all).pack(side=tk.LEFT)
+                        ttk.Button(btns, text="Deselect All", command=deselect_all).pack(side=tk.LEFT, padx=(6,0))
+
+                        actions = ttk.Frame(container)
+                        actions.pack(fill=tk.X, pady=(10,0))
+                        result: Dict[str, bool] = {rid: False for rid in checks.keys()}
+
+                        def on_ok():
+                            for rid, v in checks.items():
+                                result[rid] = bool(v.get())
+                            dlg.destroy()
+                        def on_cancel():
+                            dlg.destroy()
+                        ttk.Button(actions, text="Add Selected", command=on_ok).pack(side=tk.RIGHT)
+                        ttk.Button(actions, text="Cancel", command=on_cancel).pack(side=tk.RIGHT, padx=(0,8))
+
+                        dlg.update_idletasks()
+                        dlg.geometry("640x420")
+                        # After a short delay, refresh scrollregion and reset scroll to top to force initial render
+                        def refresh_layout():
+                            try:
+                                on_configure()
+                                canvas.yview_moveto(0)
+                            except Exception:
+                                pass
+                        root.after(50, refresh_layout)
+                        dlg.wait_window()
+                    except Exception as e:
+                        try:
+                            messagebox.showerror("Dependencies", f"Could not display required items: {e}")
+                        except Exception:
+                            pass
+                        return
+
+                    # Process selections
+                    added_count = 0
+                    skipped_no_mod = 0
+                    user_skipped = 0
+                    for it in items:
+                        rid = it["wsid"]
+                        if not result.get(rid):
+                            user_skipped += 1
+                            continue
+                        if rid in workshop_ids:
+                            continue
+                        rmods = it.get("mods", [])
+                        if not rmods:
+                            skipped_no_mod += 1
+                            continue
+                        ensure_in_list(workshop_ids, [rid])
+                        workshop_meta[rid] = it.get("meta", {})
+                        ensure_in_list(mod_ids, rmods)
+                        added_count += 1
+                        upsert_tree_item(rid, workshop_meta[rid])
+
                     ws_var.set(";".join(workshop_ids))
                     mods_var.set(";".join(mod_ids))
                     save_memory_to_files()
-                    if added_count or skipped_count:
-                        status_var.set(f"Dependencies — added: {added_count}, skipped (no Mod ID): {skipped_count}")
-                root.after(0, finalize)
-            threading.Thread(target=add_requirements, args=(wsid,), daemon=True).start()
+                    if added_count or skipped_no_mod:
+                        status_var.set(f"Dependencies — added: {added_count}, skipped (no Mod ID): {skipped_no_mod}, not selected: {user_skipped}")
+
+                root.after(0, show_dialog)
+
+            threading.Thread(target=gather_requirements, args=(wsid,), daemon=True).start()
 
     add_btn = ttk.Button(main, text="ADD", command=on_add_clicked)
     add_btn.grid(row=0, column=2, sticky="e")
@@ -940,13 +1252,23 @@ def build_gui():
 
     # Details section: list of workshop items with Name, PZ Version, Link
     ttk.Separator(main, orient="horizontal").grid(row=6, column=0, columnspan=4, pady=10, sticky="ew")
-    ttk.Label(main, text="Details (from Workshop):").grid(row=7, column=0, sticky="w")
+
+    # Search row (moved above Details)
+    search_var = tk.StringVar(value="")
+    search_row = ttk.Frame(main)
+    search_row.grid(row=7, column=0, columnspan=4, sticky="ew")
+    search_row.columnconfigure(1, weight=1)
+    ttk.Label(search_row, text="Search:").grid(row=0, column=0, padx=(0,4), sticky="w")
+    search_entry = ttk.Entry(search_row, textvariable=search_var, width=24)
+    search_entry.grid(row=0, column=1, sticky="ew")
+    # Actions row to the right of Details label
+    ttk.Label(main, text="Details (from Workshop):").grid(row=8, column=0, sticky="w")
     actions = ttk.Frame(main)
-    actions.grid(row=7, column=1, columnspan=3, sticky="e")
+    actions.grid(row=8, column=1, columnspan=3, sticky="e")
 
     # Tabs for Mods and Maps
     notebook = ttk.Notebook(main)
-    notebook.grid(row=8, column=0, columnspan=4, sticky="nsew")
+    notebook.grid(row=9, column=0, columnspan=4, sticky="nsew")
 
     # Mods tab
     mods_frame = ttk.Frame(notebook)
@@ -982,7 +1304,7 @@ def build_gui():
         maps_tree.column(col, width=width, anchor=anchor)
 
     # Allow the notebook to expand
-    main.rowconfigure(8, weight=1)
+    main.rowconfigure(9, weight=1)
     main.columnconfigure(1, weight=1)
 
     # Collections tab
@@ -1111,13 +1433,7 @@ def build_gui():
     setup_drag_select(mods_tree)
     setup_drag_select(maps_tree)
 
-    # Search/filter UI
-    search_var = tk.StringVar(value="")
-    search_frame = ttk.Frame(actions)
-    search_frame.pack(side=tk.RIGHT, padx=(8,0))
-    ttk.Label(search_frame, text="Search:").pack(side=tk.LEFT, padx=(0,4))
-    search_entry = ttk.Entry(search_frame, textvariable=search_var, width=24)
-    search_entry.pack(side=tk.LEFT)
+    # Search/filter UI (moved above Details)
     def apply_current_filter():
         term = (search_var.get() or "").strip().lower()
         def text_for_meta(meta: Dict[str, Any]) -> str:
@@ -1155,8 +1471,9 @@ def build_gui():
         search_var.set("")
         apply_current_filter()
         status_var.set("Filter cleared")
-    ttk.Button(search_frame, text="Go", command=on_search_click).pack(side=tk.LEFT, padx=(4,2))
-    ttk.Button(search_frame, text="Clear", command=on_search_clear).pack(side=tk.LEFT)
+    # Add buttons next to the moved search entry
+    ttk.Button(search_row, text="Go", command=on_search_click).grid(row=0, column=2, padx=(6,2))
+    ttk.Button(search_row, text="Clear", command=on_search_clear).grid(row=0, column=3)
     search_entry.bind("<Return>", lambda e: on_search_click())
 
     def upsert_tree_item(wsid: str, meta: Dict[str, str]):
@@ -1402,8 +1719,7 @@ def build_gui():
                 meta = get_meta_for_workshop_id(wid)
                 rmods = meta.get("mods", []) if isinstance(meta, dict) else []
                 if isinstance(rmods, list) and len(rmods) > 1:
-                    chosen_mid = choose_mod_id_dialog(rmods)
-                    rmods = [chosen_mid] if chosen_mid else []
+                    rmods = choose_mod_ids_dialog(rmods)
                 ensure_in_list(workshop_ids, [wid])
                 workshop_meta[wid] = meta
                 ensure_in_list(mod_ids, rmods)
@@ -1487,9 +1803,9 @@ def build_gui():
     for cid, cmeta in collections_meta.items():
         upsert_collection_item(cid, cmeta)
 
-    # Status bar
+    # Status bar (bottom row)
     status_lbl = ttk.Label(main, textvariable=status_var, foreground="#006400")
-    status_lbl.grid(row=9, column=0, columnspan=3, sticky="w", pady=(12, 0))
+    status_lbl.grid(row=10, column=0, columnspan=4, sticky="w", pady=(12, 0))
 
     # Grid config
     main.columnconfigure(1, weight=1)
