@@ -38,7 +38,7 @@ import tkinter.font as tkfont
 
 
 # Application version
-VERSION = "V.0.1.5+build.20251012"
+VERSION = "V.0.1.6+build.20251012"
 
 
 # App directory (next to the EXE when frozen, next to the .py when running from source)
@@ -583,7 +583,7 @@ def build_gui():
     root.title(f"PZ Workshop/Mod ID Builder — {VERSION}")
 
     # Apply global font across all widgets (named Tk fonts)
-    def _apply_global_font(family: str = "Tahoma", size: int = 10) -> None:
+    def _apply_global_font(family: str = "Tahoma", size: int = 12) -> None:
         font_names = (
             "TkDefaultFont",
             "TkTextFont",
