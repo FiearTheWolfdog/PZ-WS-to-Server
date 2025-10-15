@@ -320,8 +320,15 @@ def try_fetch_collection(url: str) -> Optional[Dict[str, Any]]:
         html_text = fetch_html(url)
     except FetchError:
         return None
+    # Determine if the page is a collection even if item extraction fails
+    is_collection = bool(
+        re.search(r"workshopCollection|collectionChildren|collectionItems|workshopItemCollection|collectionHeader", html_text, flags=re.IGNORECASE)
+        or re.search(r"Subscribe\s+to\s+all|Unsubscribe\s+from\s+all|Save\s+to\s+Collection", html_text, flags=re.IGNORECASE)
+        or re.search(r"ITEMS\s*\(\d+\)", html_text, flags=re.IGNORECASE)
+        or re.search(r"section=collections", html_text, flags=re.IGNORECASE)
+    )
     child_ids = parse_collection_children_wsids(html_text, parent_wsid=cid)
-    if not child_ids:
+    if not is_collection and not child_ids:
         return None
     title = parse_title_from_html(html_text) or f"Collection {cid}"
     return {"id": cid, "title": title, "url": url, "items": child_ids}
@@ -553,13 +560,43 @@ def parse_collection_children_wsids(html_text: str, parent_wsid: Optional[str] =
         or re.search(r"ITEMS\s*\(\d+\)", text, flags=re.IGNORECASE)
         or re.search(r"section=collections", text, flags=re.IGNORECASE)
     )
+    # Helper to extract IDs from a given HTML chunk
+    def extract_ids(chunk: str) -> List[str]:
+        found: List[str] = []
+        found += re.findall(r"sharedfiles/fil[e]?details/\?id=(\d+)", chunk, flags=re.IGNORECASE)
+        found += re.findall(r"data-publishedfileid=\"(\d+)\"", chunk, flags=re.IGNORECASE)
+        found += re.findall(r"publishedfileid\"?\s*[:=]\s*\"?(\d+)\"?", chunk, flags=re.IGNORECASE)
+        return found
+
     ids: List[str] = []
-    # Link-based extraction
-    ids.extend(re.findall(r"sharedfiles/fil[e]?details/\?id=(\d+)", text, flags=re.IGNORECASE))
-    # Attribute-based extraction (common on collection grids)
-    ids.extend(re.findall(r"data-publishedfileid=\"(\d+)\"", text, flags=re.IGNORECASE))
-    # JSON-embedded extraction
-    ids.extend(re.findall(r"publishedfileid\"?\s*[:=]\s*\"?(\d+)\"?", text, flags=re.IGNORECASE))
+    # Prefer extracting from the specific collection items section(s) only
+    chunks: List[str] = []
+    # Common container markers on Steam collection pages
+    container_markers = [
+        r"collectionChildren",
+        r"collectionItems",
+        r"workshopItemCollection",
+        r"collectionItem",
+    ]
+    for marker in container_markers:
+        m = re.search(marker, text, flags=re.IGNORECASE)
+        if not m:
+            continue
+        start = max(0, m.start())
+        # Take a generous slice forward to cover the grid
+        end = min(len(text), start + 150000)
+        chunks.append(text[start:end])
+
+    # Fallback: slice around an "ITEMS (#)" header if present
+    m_items = re.search(r"ITEMS\s*\(\d+\)", text, flags=re.IGNORECASE)
+    if m_items:
+        s = max(0, m_items.start())
+        e = min(len(text), s + 120000)
+        chunks.append(text[s:e])
+
+    # If no specific chunks found, do not scan the whole page to avoid pulling non-item IDs
+    for ch in chunks:
+        ids.extend(extract_ids(ch))
     # Filter out parent id and dedupe
     out: List[str] = []
     seen: Set[str] = set([str(parent_wsid)] if parent_wsid else [])
@@ -567,9 +604,9 @@ def parse_collection_children_wsids(html_text: str, parent_wsid: Optional[str] =
         if i not in seen:
             seen.add(i)
             out.append(i)
-    # If the page contains a 'Required items/mods' section, do not treat as collection
-    if re.search(r"Required\s+(items|mods?)", text, flags=re.IGNORECASE):
-        return []
+    # Note: Some collection pages also contain text like 'Required items'; do not
+    # treat that as a signal that this is not a collection. We rely on explicit
+    # collection markers above to determine collection status.
     # If no collection hint or no children, treat as not a collection
     if not is_collection or len(out) == 0:
         return []
@@ -858,8 +895,9 @@ def build_gui():
             return
         # Check if this is a collection URL first
         col_info = try_fetch_collection(url)
-        if col_info and isinstance(col_info, dict) and col_info.get("items"):
-            status_var.set(f"Detected collection with {len(col_info['items'])} item(s)")
+        if col_info and isinstance(col_info, dict):
+            items = list(col_info.get("items", []))
+            status_var.set(f"Detected collection with {len(items)} item(s)")
             cid = col_info["id"]
             if cid in collections_meta:
                 msg = f"Collection {cid} is already added."
@@ -874,12 +912,12 @@ def build_gui():
                 added_m_total = 0
                 skipped_total = 0
                 actually_added: List[str] = []
-                for wid in col_info["items"]:
+                for wid in items:
                     if wid in workshop_ids:
                         skipped_total += 1
                         continue
                     meta = get_meta_for_workshop_id(wid)
-                    # If multiple Mod IDs, prompt user to choose one or more
+                    # If multiple Mod IDs, prompt user to choose one or more (collection children only)
                     rmods = meta.get("mods", []) if isinstance(meta, dict) else []
                     if isinstance(rmods, list) and len(rmods) > 1:
                         chosen_mids = choose_mod_ids_dialog(rmods)
@@ -891,11 +929,12 @@ def build_gui():
                     added_m_total += added
                     actually_added.append(wid)
                     root.after(0, lambda w=wid, m=meta: upsert_tree_item(w, m))
-                # Track collection metadata (items and only those actually added by this collection)
+                    # Do NOT check required items for children of collections
+                # Track collection metadata regardless of whether items were added
                 collections_meta[cid] = {
                     "title": col_info.get("title") or f"Collection {cid}",
                     "url": col_info.get("url"),
-                    "items": list(col_info["items"]),
+                    "items": items,
                     "added": actually_added,
                 }
                 upsert_collection_item(cid, collections_meta[cid])
