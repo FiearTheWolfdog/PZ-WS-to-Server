@@ -33,7 +33,7 @@ import webbrowser
 
 # GUI imports (standard library)
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import tkinter.font as tkfont
 
 
@@ -113,6 +113,60 @@ def fetch_html(url: str, timeout: int = 20) -> str:
             return resp.read().decode(charset, errors="replace")
     except Exception as e:
         raise FetchError(f"Failed to fetch page: {e}") from e
+
+
+def fetch_collection_children_via_api(collection_id: str, timeout: int = 20) -> List[str]:
+    """Use Steam Web API to get full list of children for a collection.
+
+    Primary endpoint: ISteamRemoteStorage/GetCollectionDetails (no API key needed).
+    Returns a list of publishedfileid strings. On failure, returns empty list.
+    """
+    endpoints = [
+        "https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/",
+        # Newer service name (kept as a fallback; accepts same form params)
+        "https://api.steampowered.com/IPublishedFileService/GetCollectionDetails/v1/",
+    ]
+    ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+    data = urllib.parse.urlencode({
+        "collectioncount": "1",
+        "publishedfileids[0]": str(collection_id),
+    }).encode("utf-8")
+
+    for url in endpoints:
+        try:
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": ua,
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                charset = resp.headers.get_content_charset() or "utf-8"
+                raw = resp.read().decode(charset, errors="replace")
+                payload = json.loads(raw)
+                details = (payload or {}).get("response", {}).get("collectiondetails", [])
+                if not details:
+                    continue
+                first = details[0] if isinstance(details, list) and details else {}
+                children = first.get("children") or []
+                ids: List[str] = []
+                for ch in children:
+                    pid = (ch or {}).get("publishedfileid")
+                    if pid and str(pid).isdigit():
+                        ids.append(str(pid))
+                if ids:
+                    return ids
+        except Exception:
+            # Try next endpoint on error
+            continue
+    return []
 
 
 def parse_workshop_id(url: str) -> Optional[str]:
@@ -316,20 +370,28 @@ def try_fetch_collection(url: str) -> Optional[Dict[str, Any]]:
     cid = parse_collection_id(url)
     if not cid:
         return None
+    # First, try the Steam Web API to get the complete list of children
+    child_ids: List[str] = []
+    try:
+        child_ids = fetch_collection_children_via_api(cid)
+    except Exception:
+        child_ids = []
+
+    # Fetch HTML to extract a title and as a fallback for children if API returned none
+    html_text = ""
     try:
         html_text = fetch_html(url)
     except FetchError:
+        html_text = ""
+
+    # Fallback to HTML scraping for children when API gives nothing
+    if not child_ids and html_text:
+        child_ids = parse_collection_children_wsids(html_text, parent_wsid=cid)
+
+    # Only treat as a collection if we actually discovered child items
+    if not child_ids:
         return None
-    # Determine if the page is a collection even if item extraction fails
-    is_collection = bool(
-        re.search(r"workshopCollection|collectionChildren|collectionItems|workshopItemCollection|collectionHeader", html_text, flags=re.IGNORECASE)
-        or re.search(r"Subscribe\s+to\s+all|Unsubscribe\s+from\s+all|Save\s+to\s+Collection", html_text, flags=re.IGNORECASE)
-        or re.search(r"ITEMS\s*\(\d+\)", html_text, flags=re.IGNORECASE)
-        or re.search(r"section=collections", html_text, flags=re.IGNORECASE)
-    )
-    child_ids = parse_collection_children_wsids(html_text, parent_wsid=cid)
-    if not is_collection and not child_ids:
-        return None
+
     title = parse_title_from_html(html_text) or f"Collection {cid}"
     return {"id": cid, "title": title, "url": url, "items": child_ids}
 
@@ -540,6 +602,67 @@ def save_memory_to_files() -> None:
             json.dump(workshop_meta, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+def update_server_ini_file(path: str, mods: List[str], wsids: List[str]) -> Tuple[bool, str]:
+    """Update the given server INI with Mods and WorkshopItems values.
+
+    - Creates a .bak backup next to the INI before writing.
+    - Writes semicolon-separated values on single lines.
+    - Attempts to preserve lines not related to Mods/WorkshopItems.
+    Returns (ok, message).
+    """
+    try:
+        if not os.path.exists(path):
+            return False, f"Server INI not found: {path}"
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.read().splitlines()
+
+        # Backup
+        try:
+            import shutil
+            bak = path + ".bak"
+            shutil.copy2(path, bak)
+        except Exception:
+            pass
+
+        def is_key(line: str, key: str) -> bool:
+            return line.strip().lower().startswith(key.lower() + "=")
+
+        mods_line = f"Mods={'/'.join([])}"  # placeholder to ensure type
+        # Actual content is semicolon-separated per app convention
+        mods_line = f"Mods={';'.join(mods)}"
+        ws_line = f"WorkshopItems={';'.join(wsids)}"
+
+        out: List[str] = []
+        saw_mods = False
+        saw_ws = False
+        for line in lines:
+            if is_key(line, "Mods"):
+                if not saw_mods:
+                    out.append(mods_line)
+                    saw_mods = True
+                # Skip other Mods lines (dedupe)
+                continue
+            if is_key(line, "WorkshopItems"):
+                if not saw_ws:
+                    out.append(ws_line)
+                    saw_ws = True
+                # Skip duplicates
+                continue
+            out.append(line)
+
+        # Append keys if not present
+        if not saw_mods:
+            out.append(mods_line)
+        if not saw_ws:
+            out.append(ws_line)
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+        return True, "Server INI updated successfully. A .bak backup was created."
+    except Exception as e:
+        return False, f"Failed to update INI: {e}"
     # Save collections meta (separate try so a failure above doesn't skip this)
     try:
         with open(COLLECTIONS_FILE, "w", encoding="utf-8") as f:
@@ -702,10 +825,22 @@ def build_gui():
         style.configure("TButton", padding=4)
         style.configure("TEntry", fieldbackground=entry_bg, foreground=fg)
         style.configure("TSeparator", background=bg)
+        # Notebook and tabs
+        try:
+            style.configure("TNotebook", background=bg)
+            style.configure("TNotebook.Tab", background=bg, foreground=fg)
+            style.map("TNotebook.Tab", background=[("selected", entry_bg)], foreground=[("selected", fg)])
+        except Exception:
+            pass
+        # Checkbuttons (used in selection dialogs)
+        try:
+            style.configure("TCheckbutton", background=bg, foreground=fg)
+        except Exception:
+            pass
 
         # Treeview styling
         style.configure("Treeview", background=bg, fieldbackground=bg, foreground=fg, rowheight=22)
-        style.map("Treeview", background=[("selected", selbg)])
+        style.map("Treeview", background=[("selected", selbg)], foreground=[("selected", fg)])
         style.configure("Treeview.Heading", background=bg, foreground=fg)
 
         # Update status label color if already created
@@ -722,6 +857,11 @@ def build_gui():
     # Initialize dark mode from settings before wiring the menu
     _settings = read_settings()
     dark_mode.set(bool(_settings.get("dark_mode", False)))
+    # Apply the theme immediately so startup honors saved preference
+    try:
+        apply_theme(bool(dark_mode.get()))
+    except Exception:
+        pass
     view_menu.add_checkbutton(label="Dark Mode", variable=dark_mode, command=toggle_dark)
 
     # File menu
@@ -838,12 +978,22 @@ def build_gui():
             pass
         win.transient(root)
         win.grab_set()
+        # Apply basic dark/light background for the dialog window
+        try:
+            win.configure(background=("#1e1e1e" if dark_mode.get() else "#f0f0f0"))
+        except Exception:
+            pass
         ttk.Label(win, text="Multiple Mod IDs found. Select one or more to add:").pack(anchor="w", padx=10, pady=(10, 6))
 
         # Scrollable area with checkboxes
         outer = ttk.Frame(win)
         outer.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
-        canvas = tk.Canvas(outer, highlightthickness=0)
+        # Canvas adopts background to match theme for better contrast
+        try:
+            _canvas_bg = "#1e1e1e" if dark_mode.get() else "#ffffff"
+        except Exception:
+            _canvas_bg = "#ffffff"
+        canvas = tk.Canvas(outer, highlightthickness=0, background=_canvas_bg)
         vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         inner = ttk.Frame(canvas)
         inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
@@ -888,12 +1038,13 @@ def build_gui():
         win.protocol("WM_DELETE_WINDOW", on_ok)
         win.update_idletasks()
         # Heuristic sizing based on option count with floor/ceiling to keep buttons visible
-        base_w = 460
-        # Use a slightly taller row height to account for DPI and font size
-        row_h = 26
-        base_h = 280  # minimum so bottom buttons are not clipped
-        max_h = 600   # reasonable upper bound
-        calculated_h = 140 + row_h * len(options)
+        # Bump defaults to be safe on 125%-150% DPI
+        base_w = 520
+        # Taller row height to account for DPI and font size
+        row_h = 28
+        base_h = 420  # minimum so bottom buttons are not clipped
+        max_h = 900   # reasonable upper bound
+        calculated_h = 200 + row_h * len(options)
         height = max(base_h, min(max_h, calculated_h))
         try:
             win.minsize(base_w, base_h)
@@ -1304,25 +1455,80 @@ def build_gui():
         status_var.set("Copied Workshop IDs to clipboard")
     ttk.Button(main, text="Copy", command=copy_ws).grid(row=5, column=2, sticky="e")
 
-    # Details section: list of workshop items with Name, PZ Version, Link
+    # Server INI update section
     ttk.Separator(main, orient="horizontal").grid(row=6, column=0, columnspan=4, pady=10, sticky="ew")
+    ttk.Label(main, text="Server INI file:").grid(row=7, column=0, sticky="w")
+    # Prefill from saved settings to avoid reselecting each launch
+    server_ini_var = tk.StringVar(value=str(_settings.get("server_ini_path", "")))
+    server_ini_entry = ttk.Entry(main, textvariable=server_ini_var)
+    server_ini_entry.grid(row=7, column=1, sticky="ew", padx=(8, 8))
+    # Auto-persist when the user edits the entry and leaves the field
+    try:
+        server_ini_entry.bind(
+            "<FocusOut>",
+            lambda e: write_settings({"server_ini_path": server_ini_var.get().strip()}),
+        )
+    except Exception:
+        pass
+
+    def browse_ini():
+        try:
+            path = filedialog.askopenfilename(
+                title="Select server INI",
+                filetypes=[("INI files", "*.ini"), ("All files", "*.*")],
+            )
+            if path:
+                server_ini_var.set(path)
+                try:
+                    write_settings({"server_ini_path": path})
+                except Exception:
+                    pass
+                status_var.set(f"Server INI selected: {path}")
+        except Exception:
+            pass
+
+    def update_ini_now():
+        path = server_ini_var.get().strip()
+        if not path:
+            messagebox.showwarning("Missing INI", "Please select a server INI file first.")
+            return
+        ok, msg = update_server_ini_file(path, mod_ids, workshop_ids)
+        status_var.set(msg)
+        # Persist the path used for update
+        try:
+            write_settings({"server_ini_path": path})
+        except Exception:
+            pass
+        try:
+            if ok:
+                messagebox.showinfo("INI Updated", msg)
+            else:
+                messagebox.showerror("INI Update Failed", msg)
+        except Exception:
+            pass
+
+    ttk.Button(main, text="Browse…", command=browse_ini).grid(row=7, column=2, sticky="e")
+    ttk.Button(main, text="Update INI from lists", command=update_ini_now).grid(row=7, column=3, sticky="e")
+
+    # Details section: list of workshop items with Name, PZ Version, Link
+    ttk.Separator(main, orient="horizontal").grid(row=8, column=0, columnspan=4, pady=10, sticky="ew")
 
     # Search row (moved above Details)
     search_var = tk.StringVar(value="")
     search_row = ttk.Frame(main)
-    search_row.grid(row=7, column=0, columnspan=4, sticky="ew")
+    search_row.grid(row=9, column=0, columnspan=4, sticky="ew")
     search_row.columnconfigure(1, weight=1)
     ttk.Label(search_row, text="Search:").grid(row=0, column=0, padx=(0,4), sticky="w")
     search_entry = ttk.Entry(search_row, textvariable=search_var, width=24)
     search_entry.grid(row=0, column=1, sticky="ew")
     # Actions row to the right of Details label
-    ttk.Label(main, text="Details (from Workshop):").grid(row=8, column=0, sticky="w")
+    ttk.Label(main, text="Details (from Workshop):").grid(row=10, column=0, sticky="w")
     actions = ttk.Frame(main)
-    actions.grid(row=8, column=1, columnspan=3, sticky="e")
+    actions.grid(row=10, column=1, columnspan=3, sticky="e")
 
     # Tabs for Mods and Maps
     notebook = ttk.Notebook(main)
-    notebook.grid(row=9, column=0, columnspan=4, sticky="nsew")
+    notebook.grid(row=11, column=0, columnspan=4, sticky="nsew")
 
     # Mods tab
     mods_frame = ttk.Frame(notebook)
@@ -1358,7 +1564,7 @@ def build_gui():
         maps_tree.column(col, width=width, anchor=anchor)
 
     # Allow the notebook to expand
-    main.rowconfigure(9, weight=1)
+    main.rowconfigure(11, weight=1)
     main.columnconfigure(1, weight=1)
 
     # Collections tab
@@ -1859,7 +2065,7 @@ def build_gui():
 
     # Status bar (bottom row)
     status_lbl = ttk.Label(main, textvariable=status_var, foreground="#006400")
-    status_lbl.grid(row=10, column=0, columnspan=4, sticky="w", pady=(12, 0))
+    status_lbl.grid(row=12, column=0, columnspan=4, sticky="w", pady=(12, 0))
 
     # Grid config
     main.columnconfigure(1, weight=1)
