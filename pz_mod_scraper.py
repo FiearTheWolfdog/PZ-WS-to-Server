@@ -831,6 +831,11 @@ def build_gui():
             return []
         win = tk.Toplevel(root)
         win.title("Select Mod IDs")
+        # Allow resizing but ensure sensible defaults and minimums so buttons are visible
+        try:
+            win.resizable(True, True)
+        except Exception:
+            pass
         win.transient(root)
         win.grab_set()
         ttk.Label(win, text="Multiple Mod IDs found. Select one or more to add:").pack(anchor="w", padx=10, pady=(10, 6))
@@ -882,9 +887,19 @@ def build_gui():
         # Close acts like cancel (keep current selection state)
         win.protocol("WM_DELETE_WINDOW", on_ok)
         win.update_idletasks()
-        # Heuristic height based on option count
-        height = min(360, 140 + 22*len(options))
-        win.geometry(f"420x{height}")
+        # Heuristic sizing based on option count with floor/ceiling to keep buttons visible
+        base_w = 460
+        # Use a slightly taller row height to account for DPI and font size
+        row_h = 26
+        base_h = 280  # minimum so bottom buttons are not clipped
+        max_h = 600   # reasonable upper bound
+        calculated_h = 140 + row_h * len(options)
+        height = max(base_h, min(max_h, calculated_h))
+        try:
+            win.minsize(base_w, base_h)
+        except Exception:
+            pass
+        win.geometry(f"{base_w}x{height}")
         win.wait_window()
         return selected
 
