@@ -14,9 +14,9 @@ All without external dependencies.
 ## Download and run on Windows (no install)
 
 - If you're on Windows and just want to use the app, you only need the single EXE—no installation required.
-- Download the file named `Fiears PZ WS to Server.exe` from this repository and run it:
+- Download the file named `PZ Dedi Serv and Mod Manager.exe` from this repository and run it:
 	- Direct link (main branch):
-		- https://github.com/FiearTheWolfdog/PZ-WS-to-Server/raw/main/Fiears%20PZ%20WS%20to%20Server.exe
+		- https://github.com/FiearTheWolfdog/PZ-WS-to-Server/raw/main/PZ%20Dedi%20Serv%20and%20Mod%20Manager.exe
 	- Or check the Releases page if available.
 - PLEASE use a dedicated folder for this EXE — it WILL create/update data files next to itself as you use the program.
 - The EXE is portable. It will create/update its data files (Settings/Collections/WorkshopMeta/ModIDs/WorkshopIDs) next to the EXE.
@@ -26,7 +26,7 @@ All without external dependencies.
 ### Update to a new version (Windows EXE)
 
 - Close the app if it’s running.
-- Download the new `Fiears PZ WS to Server.exe` and replace your existing EXE file in the same folder.
+- Download the new `PZ Dedi Serv and Mod Manager.exe` and replace your existing EXE file in the same folder.
 - Your data files (Settings/Collections/WorkshopMeta/ModIDs/WorkshopIDs) stay in that folder and will be reused automatically.
 
 ## Highlights
@@ -116,7 +116,7 @@ All files live in this folder alongside the script.
 
 - Prefer grabbing downloads from the Releases page when available:
 	- https://github.com/FiearTheWolfdog/PZ-WS-to-Server/releases
-- Download the `Fiears PZ WS to Server.exe` asset. It’s a single portable file—no installer.
+- Download the `PZ Dedi Serv and Mod Manager.exe` asset. It’s a single portable file—no installer.
 - To update: close the app, replace the EXE in your folder, and re-open. Your data files in that folder will be reused.
 
 ## Changelog

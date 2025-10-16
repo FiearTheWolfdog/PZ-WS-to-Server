@@ -28,7 +28,7 @@ dist/
 *.pkg
 
 # Allow the main distributable EXE to be committed
-!Fiears PZ WS to Server.exe
+!PZ Dedi Serv and Mod Manager.exe
 
 # Local app data files (generated/exported)
 Settings.json

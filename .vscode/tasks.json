@@ -172,7 +172,7 @@
 				"--onefile",
 				"--windowed",
 				"--name",
-				"Fiears PZ WS to Server",
+				"PZ Dedi Serv and Mod Manager",
 				"--distpath",
 				"dist",
 				"--workpath",
@@ -186,7 +186,7 @@
 				"pz_mod_scraper.py"
 			],
 			"problemMatcher": [
-				"$gcc"
+				"$python"
 			],
 			"group": "build"
 		},
@@ -201,7 +201,7 @@
 				"--onefile",
 				"--windowed",
 				"--name",
-				"Fiears PZ WS to Server",
+				"PZ Dedi Serv and Mod Manager",
 				"--distpath",
 				"dist",
 				"--workpath",
@@ -215,7 +215,7 @@
 				"pz_mod_scraper.py"
 			],
 			"problemMatcher": [
-				"$gcc"
+				"$python"
 			],
 			"group": "build"
 		}
