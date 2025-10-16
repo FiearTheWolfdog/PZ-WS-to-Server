@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# PyInstaller
+*.spec
+build/
+dist/
+
+# Executables and binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Logs and reports
+*.log
+*.tmp
+*.toc
+*.html
+*.zip
+*.pkg
+
+# Local app data files (generated/exported)
+Settings.json
+Descriptions.json
+Collections.json
+ModIDs.txt
+WorkshopIDs.txt
+WorkshopMeta.json
+
+# Test output folder
+Test folder/
+
+# OS files
+.DS_Store
+Thumbs.db
+
