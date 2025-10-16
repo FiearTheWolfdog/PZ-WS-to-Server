@@ -112,6 +112,13 @@ All files live in this folder alongside the script.
 - If links don’t open on click, ensure your default browser is configured: Windows Settings → Apps → Default apps.
 - To reset, close the app and delete `WorkshopMeta.json`, `Collections.json`, `WorkshopIDs.txt`, and `ModIDs.txt` (optional). Re-open to rebuild.
 
+## Releases
+
+- Prefer grabbing downloads from the Releases page when available:
+	- https://github.com/FiearTheWolfdog/PZ-WS-to-Server/releases
+- Download the `Fiears PZ WS to Server.exe` asset. It’s a single portable file—no installer.
+- To update: close the app, replace the EXE in your folder, and re-open. Your data files in that folder will be reused.
+
 ## Changelog
 
 - 2025-10-06: Info dialog links are now clickable. Collections import/refresh prompt for Mod ID selection when children have multiple IDs.
