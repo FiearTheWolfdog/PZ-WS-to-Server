@@ -27,6 +27,9 @@ dist/
 *.zip
 *.pkg
 
+# Allow the main distributable EXE to be committed
+!Fiears PZ WS to Server.exe
+
 # Local app data files (generated/exported)
 Settings.json
 Descriptions.json
