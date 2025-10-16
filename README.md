@@ -1,4 +1,4 @@
-# Project Zomboid Workshop Manager
+# Fiear's Project Zomboid Steam Workshop and Server Manager
 
 A lightweight Python/Tkinter app for managing Project Zomboid Steam Workshop content. Paste a Workshop link and the app will extract and maintain:
 
