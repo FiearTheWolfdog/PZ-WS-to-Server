@@ -2,6 +2,7 @@
 
 A lightweight Python/Tkinter app for managing Project Zomboid Steam Workshop content. Paste a Workshop link and the app will extract and maintain:
 
+- Dedicated Server Manager helper
 - Workshop ID(s)
 - Mod ID(s)
 - Metadata (Name, PZ Build, Tags, Link)
@@ -17,9 +18,16 @@ All without external dependencies.
 	- Direct link (main branch):
 		- https://github.com/FiearTheWolfdog/PZ-WS-to-Server/raw/main/Fiears%20PZ%20WS%20to%20Server.exe
 	- Or check the Releases page if available.
+- PLEASE use a dedicated folder for this EXE — it WILL create/update data files next to itself as you use the program.
 - The EXE is portable. It will create/update its data files (Settings/Collections/WorkshopMeta/ModIDs/WorkshopIDs) next to the EXE.
 - If Windows SmartScreen warns about an unrecognized app:
 	- Click "More info" → "Run anyway".
+
+### Update to a new version (Windows EXE)
+
+- Close the app if it’s running.
+- Download the new `Fiears PZ WS to Server.exe` and replace your existing EXE file in the same folder.
+- Your data files (Settings/Collections/WorkshopMeta/ModIDs/WorkshopIDs) stay in that folder and will be reused automatically.
 
 ## Highlights
 
