@@ -1,48 +1,30 @@
 #!/usr/bin/env python3
 """
 Project Zomboid Workshop/Mod ID scraper with GUI
-
-Two modes:
-    - GUI (default): paste a Steam Workshop URL and click ADD to build one-line,
-        semicolon-separated lists for Mod IDs and Workshop IDs.
-    - CLI: pass URLs as arguments (or use --cli to enter interactive mode).
-
-Output files in this folder:
-    - WorkshopIDs.txt — ONE LINE ONLY, semicolon-separated list of workshop item IDs
-    - ModIDs.txt      — ONE LINE ONLY, semicolon-separated list of mod IDs
-
-Notes:
-    - Mod ID(s) are parsed from the Workshop page description lines like "Mod ID:" or
-        "Mod IDs:". If not present, Mod IDs cannot be inferred without downloading the mod.
-    - Multiple Mod IDs on a single line are supported (comma/semicolon/space separated).
-    - Entries are de-duplicated case-insensitively; display preserves insertion order.
 """
 
-from __future__ import annotations
-
-import html
 import os
-import re
 import sys
-import urllib.parse
-import urllib.request
-from typing import Iterable, List, Optional, Set, Tuple, Dict, Any
+import re
 import json
-import threading
+import html
+import urllib.request
+import urllib.parse
 import webbrowser
+from typing import List, Dict, Any, Optional, Tuple, Set, Iterable
+import threading
+import ipaddress
 
-# GUI imports (standard library)
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, messagebox, filedialog
 import tkinter.font as tkfont
 
+# App version (shown in title and Info dialog)
+VERSION = "V.0.2.0+build.20251015"
 
-# Application version
-VERSION = "V.0.1.6+build.20251012"
-
-
-# App directory (next to the EXE when frozen, next to the .py when running from source)
-if getattr(sys, 'frozen', False):
+# Determine app dir for reading/writing adjacent files (works for PyInstaller too)
+if getattr(sys, "frozen", False):
     APP_DIR = os.path.dirname(sys.executable)
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -57,6 +39,7 @@ META_FILE = _path_in_app_dir("WorkshopMeta.json")
 ABOUT_FILE = _path_in_app_dir("AboutInfo.txt")
 SETTINGS_FILE = _path_in_app_dir("Settings.json")
 COLLECTIONS_FILE = _path_in_app_dir("Collections.json")
+DESCRIPTIONS_FILE = _path_in_app_dir("Descriptions.json")
 
 # Access bundled resources when frozen (PyInstaller provides sys._MEIPASS)
 def _resource_path(name: str) -> str:
@@ -76,11 +59,11 @@ DEFAULT_ABOUT_TEXT = (
 )
 
 # Allowed tags (canonical forms)
-ALLOWED_TAGS: List[str] = [
-    "Build 40","Build 41","Build 42","Animals","Audio","Balance","Building","Clothing/Armor",
-    "Farming","Food","Framework","Hardmode","Interface","Items","Language/Translation","Literature",
-    "Map","Military","Misc","Models","Multiplayer","Pop Culture","QoL","Realistic","Silly/Fun",
-    "Skills","Textures","Traits","Vehicles","Weapons","WIP",
+ALLOWED_TAGS = [
+    "Build 40", "Build 41", "Build 42", "Animals", "Audio", "Balance", "Building", "Clothing/Armor",
+    "Farming", "Food", "Framework", "Hardmode", "Interface", "Items", "Language/Translation", "Literature",
+    "Map", "Military", "Misc", "Models", "Multiplayer", "Pop Culture", "QoL", "Realistic", "Silly/Fun",
+    "Skills", "Textures", "Traits", "Vehicles", "Weapons", "WIP",
 ]
 ALLOWED_TAGS_MAP = {t.lower(): t for t in ALLOWED_TAGS}
 
@@ -670,6 +653,518 @@ def update_server_ini_file(path: str, mods: List[str], wsids: List[str]) -> Tupl
     except Exception:
         pass
 
+def read_server_ini_values(path: str) -> Tuple[List[str], List[str]]:
+    """Read Mods and WorkshopItems from a server INI.
+
+    Returns (mods_list, workshop_ids_list). Missing keys yield empty lists.
+    """
+    mods: List[str] = []
+    wsids: List[str] = []
+    try:
+        if not os.path.exists(path):
+            return mods, wsids
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                k, sep, v = line.partition("=")
+                if not sep:
+                    continue
+                key = k.strip().lower()
+                val = v.strip()
+                if key == "mods":
+                    mods = [p.strip() for p in val.split(";") if p.strip()]
+                elif key == "workshopitems":
+                    wsids = [p.strip() for p in val.split(";") if p.strip()]
+    except Exception:
+        # Return whatever was parsed up to the error
+        pass
+    return mods, wsids
+
+
+def parse_server_ini_all(path: str) -> Tuple[bool, Dict[str, str], str, List[str]]:
+    """Parse a Project Zomboid server.ini-like file into a dict of key->value.
+
+    - Preserves last occurrence when duplicate keys exist.
+    - Returns (ok, data, message, original_lines)
+    """
+    try:
+        if not os.path.exists(path):
+            return False, {}, f"Server INI not found: {path}", []
+        data: Dict[str, str] = {}
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.read().splitlines()
+        for raw in lines:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            k, sep, v = line.partition("=")
+            if not sep:
+                continue
+            key = k.strip()
+            val = v.strip()
+            data[key] = val
+        return True, data, "Loaded server INI.", lines
+    except Exception as e:
+        return False, {}, f"Failed to read INI: {e}", []
+
+
+def save_server_ini_all(path: str, new_values: Dict[str, Any], original_lines: Optional[List[str]] = None) -> Tuple[bool, str]:
+    """Save server INI by merging new key-values into existing file content.
+
+    - Creates a .bak backup.
+    - Replaces first occurrence of each known key, drops duplicate later occurrences.
+    - Appends new keys not present originally at the end.
+    - Values are stringified; booleans become 'true'/'false'.
+    """
+    try:
+        if not os.path.exists(path):
+            return False, f"Server INI not found: {path}"
+        if original_lines is None:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                original_lines = f.read().splitlines()
+
+        # Backup
+        try:
+            import shutil
+            bak = path + ".bak"
+            shutil.copy2(path, bak)
+        except Exception:
+            pass
+
+        def stringify(v: Any) -> str:
+            if isinstance(v, bool):
+                return "true" if v else "false"
+            return str(v)
+
+        out: List[str] = []
+        seen: Dict[str, bool] = {}
+        for raw in original_lines:
+            line = raw
+            s = line.strip()
+            if not s or s.startswith("#"):
+                out.append(line)
+                continue
+            k, sep, v = line.partition("=")
+            if not sep:
+                out.append(line)
+                continue
+            key = k.strip()
+            if key in new_values:
+                if not seen.get(key):
+                    out.append(f"{key}={stringify(new_values[key])}")
+                    seen[key] = True
+                # else skip duplicate occurrences
+            else:
+                out.append(line)
+
+        # Append keys not present before
+        for key, val in new_values.items():
+            if not seen.get(key):
+                out.append(f"{key}={stringify(val)}")
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+        return True, "Server INI saved (.bak created)."
+    except Exception as e:
+        return False, f"Failed to save INI: {e}"
+
+# --- User-editable descriptions storage (INI and SandboxVars) ---
+# We support two layers:
+# 1) Embedded defaults (read-only) from the PyInstaller bundle, loaded via _resource_path.
+# 2) User overrides from DESCRIPTIONS_FILE next to the EXE/script.
+_DESC_DEFAULTS: Dict[str, Dict[str, str]] = {"ini": {}, "sandbox": {}}
+_DESC_DEFAULTS_LOADED: bool = False
+_DESC_OVERRIDES: Dict[str, Dict[str, str]] = {"ini": {}, "sandbox": {}}
+_DESC_LOADED: bool = False
+
+def _load_default_descriptions() -> None:
+    """Load read-only defaults from embedded Descriptions.json if present."""
+    global _DESC_DEFAULTS_LOADED, _DESC_DEFAULTS
+    if _DESC_DEFAULTS_LOADED:
+        return
+    try:
+        rpath = _resource_path("Descriptions.json")
+        if os.path.exists(rpath):
+            with open(rpath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                ini = data.get("ini")
+                sbox = data.get("sandbox")
+                if isinstance(ini, dict):
+                    _DESC_DEFAULTS["ini"].update({str(k): str(v) for k, v in ini.items()})
+                if isinstance(sbox, dict):
+                    _DESC_DEFAULTS["sandbox"].update({str(k): str(v) for k, v in sbox.items()})
+    except Exception:
+        # Ignore: defaults remain empty
+        pass
+    _DESC_DEFAULTS_LOADED = True
+
+def _ensure_descriptions_loaded() -> None:
+    global _DESC_LOADED, _DESC_OVERRIDES
+    # Always ensure defaults are loaded once
+    _load_default_descriptions()
+    if _DESC_LOADED:
+        return
+    try:
+        if os.path.exists(DESCRIPTIONS_FILE):
+            with open(DESCRIPTIONS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                ini = data.get("ini")
+                sbox = data.get("sandbox")
+                if isinstance(ini, dict):
+                    _DESC_OVERRIDES["ini"].update({str(k): str(v) for k, v in ini.items()})
+                if isinstance(sbox, dict):
+                    _DESC_OVERRIDES["sandbox"].update({str(k): str(v) for k, v in sbox.items()})
+    except Exception:
+        pass
+    _DESC_LOADED = True
+
+def get_description(category: str, key: str, fallback: str) -> str:
+    """Return user override if present; else embedded default; else fallback."""
+    _ensure_descriptions_loaded()
+    try:
+        if key in _DESC_OVERRIDES.get(category, {}):
+            return _DESC_OVERRIDES[category][key]
+        if key in _DESC_DEFAULTS.get(category, {}):
+            return _DESC_DEFAULTS[category][key]
+        return fallback
+    except Exception:
+        return fallback
+
+def set_description(category: str, key: str, text: str) -> bool:
+    """Update and persist a description override. Returns True on success."""
+    _ensure_descriptions_loaded()
+    try:
+        if category not in _DESC_OVERRIDES:
+            _DESC_OVERRIDES[category] = {}
+        _DESC_OVERRIDES[category][key] = text
+        data = {
+            "ini": _DESC_OVERRIDES.get("ini", {}),
+            "sandbox": _DESC_OVERRIDES.get("sandbox", {}),
+        }
+        with open(DESCRIPTIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+def reload_descriptions() -> bool:
+    """Force reload of the external overrides file. Returns True if changed.
+    Embedded defaults remain cached; only overrides are reloaded here.
+    """
+    global _DESC_OVERRIDES, _DESC_LOADED
+    try:
+        new_data: Dict[str, Dict[str, str]] = {"ini": {}, "sandbox": {}}
+        if os.path.exists(DESCRIPTIONS_FILE):
+            with open(DESCRIPTIONS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                ini = data.get("ini")
+                sbox = data.get("sandbox")
+                if isinstance(ini, dict):
+                    new_data["ini"].update({str(k): str(v) for k, v in ini.items()})
+                if isinstance(sbox, dict):
+                    new_data["sandbox"].update({str(k): str(v) for k, v in sbox.items()})
+        changed = json.dumps(new_data, sort_keys=True) != json.dumps(_DESC_OVERRIDES, sort_keys=True)
+        if changed:
+            _DESC_OVERRIDES = new_data
+        _DESC_LOADED = True
+        return changed
+    except Exception:
+        return False
+
+
+# Optional: human-friendly descriptions for common Server INI keys
+SERVER_INI_DESCRIPTIONS: Dict[str, str] = {
+    # Networking
+    "DefaultPort": "Game server port (UDP). Default 16261.",
+    "UDPPort": "UDP port used for server/client traffic.",
+    "SteamPort1": "Steam peer port for queries/auth.",
+    "SteamPort2": "Second Steam port.",
+    "server_browser_announced_ip": "Public IPv4 announced to the Steam server browser.",
+    # Players / Auth
+    "PublicName": "Public name of your server shown in the browser.",
+    "PublicDescription": "Short description shown in the browser.",
+    "Password": "Password required for clients to join (leave empty for none).",
+    "MaxPlayers": "Maximum number of players allowed.",
+    # Gameplay / Anti-cheat
+    "PVP": "Enable player-vs-player combat.",
+    "Open": "Allow connections without whitelist.",
+    "Whitelist": "Only allow players in whitelist.",
+    "KickFastPlayers": "Kicks players moving too fast (anti-cheat).",
+    # Files / Saves
+    "Mods": "Semicolon-separated mod IDs loaded by the server.",
+    "WorkshopItems": "Semicolon-separated Steam Workshop IDs to download.",
+}
+
+# Keys that should never be treated as booleans even if their value is "0"/"1"
+# These will be rendered as text/number entries (e.g., MaxAccountsPerUser)
+SERVER_INI_FORCE_NUMBER_KEYS = {
+    "maxaccountsperuser",
+}
+
+
+# --- SandboxVars.lua helpers ---
+# Optional descriptions for common SandboxVars keys (fallback to key name if missing)
+SANDBOX_DESCRIPTIONS: Dict[str, str] = {
+    # Population/zombies
+    "PopulationMultiplier": "Overall zombie population multiplier.",
+    "PopulationStartMultiplier": "Zombie pop at game start (relative to peak).",
+    "PopulationPeakMultiplier": "Zombie pop at peak day.",
+    "PopulationPeakDay": "Day when zombie population reaches peak.",
+    "RespawnHours": "Hours between zombie respawns in a cell.",
+    "RespawnUnseenHours": "Hours since cell unseen required before respawn.",
+    "RedistributeHours": "Hours between zombie migration (redistribution).",
+    # Loot
+    "LootRespawn": "Loot respawn frequency (0=never).",
+    "SeenHoursPreventLootRespawn": "Hours a container must be unseen to respawn loot.",
+    "FoodLoot": "Food loot abundance.",
+    "WeaponLoot": "Weapon loot abundance.",
+    "OtherLoot": "Misc loot abundance.",
+    # Time and world
+    "DayLength": "Length of a day (in minutes).",
+    "StartMonth": "Start month (1-12).",
+    "StartDay": "Start day (1-31).",
+    "StartTime": "Start time (0-23 hours).",
+    # Bodies
+    "HoursForCorpseRemoval": "Hours before corpses are removed (0=never).",
+    # Meta
+    "GeneratorFuelConsumption": "Generator fuel consumption multiplier.",
+}
+def _strip_lua_comments(text: str) -> str:
+    """Remove Lua line (--) and block (--[[ ... ]]) comments."""
+    # Remove block comments
+    text = re.sub(r"--\[\[.*?\]\]", "", text, flags=re.DOTALL)
+    # Remove line comments
+    text = re.sub(r"--[^\n]*", "", text)
+    return text
+
+
+def _find_sandbox_table(text: str) -> Optional[str]:
+    """Extract the table literal assigned to SandboxVars = { ... }.
+    Returns the substring starting at '{' and ending at matching '}', or None.
+    """
+    m = re.search(r"SandboxVars\s*=\s*\{", text)
+    if not m:
+        return None
+    i = m.end() - 1  # position at '{'
+    depth = 0
+    in_str = False
+    str_char = ''
+    escape = False
+    start = i
+    for idx in range(i, len(text)):
+        ch = text[idx]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == str_char:
+                in_str = False
+            continue
+        if ch in ('"', "'"):
+            in_str = True
+            str_char = ch
+            continue
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                end = idx
+                return text[start:end+1]
+    return None
+
+
+class _LuaTok:
+    def __init__(self, s: str):
+        self.s = s
+        self.i = 0
+
+    def peek(self) -> str:
+        return self.s[self.i] if self.i < len(self.s) else ''
+
+    def next(self) -> str:
+        ch = self.peek()
+        self.i += 1
+        return ch
+
+    def skip_ws(self):
+        while self.peek() and self.peek().isspace():
+            self.i += 1
+
+    def consume(self, expected: str) -> bool:
+        self.skip_ws()
+        if self.s.startswith(expected, self.i):
+            self.i += len(expected)
+            return True
+        return False
+
+    def parse_identifier(self) -> Optional[str]:
+        self.skip_ws()
+        m = re.match(r"[A-Za-z_][A-Za-z0-9_]*", self.s[self.i:])
+        if not m:
+            return None
+        name = m.group(0)
+        self.i += len(name)
+        return name
+
+    def parse_string(self) -> Optional[str]:
+        self.skip_ws()
+        ch = self.peek()
+        if ch not in ('"', "'"):
+            return None
+        quote = self.next()
+        out = []
+        esc = False
+        while True:
+            c = self.next()
+            if not c:
+                break
+            if esc:
+                out.append(c)
+                esc = False
+                continue
+            if c == '\\':
+                esc = True
+                continue
+            if c == quote:
+                break
+            out.append(c)
+        return ''.join(out)
+
+    def parse_number(self) -> Optional[float]:
+        self.skip_ws()
+        m = re.match(r"[-+]?(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][-+]?\d+)?", self.s[self.i:])
+        if not m:
+            return None
+        num = m.group(0)
+        self.i += len(num)
+        try:
+            if '.' in num or 'e' in num.lower():
+                return float(num)
+            return int(num)
+        except Exception:
+            try:
+                return float(num)
+            except Exception:
+                return None
+
+
+def _parse_lua_value(tok: _LuaTok):
+    tok.skip_ws()
+    # Booleans
+    if tok.s.startswith('true', tok.i):
+        tok.i += 4
+        return True
+    if tok.s.startswith('false', tok.i):
+        tok.i += 5
+        return False
+    # String
+    s = tok.parse_string()
+    if s is not None:
+        return s
+    # Number
+    n = tok.parse_number()
+    if n is not None:
+        return n
+    # Table
+    if tok.consume('{'):
+        obj: Dict[str, Any] = {}
+        first = True
+        while True:
+            tok.skip_ws()
+            if tok.consume('}'):
+                break
+            if not first and tok.consume(','):
+                tok.skip_ws()
+            # key = value
+            key = tok.parse_identifier()
+            if not key:
+                # try string key
+                key = tok.parse_string()
+            tok.skip_ws()
+            tok.consume('=')
+            val = _parse_lua_value(tok)
+            if key is None:
+                key = ''
+            obj[str(key)] = val
+            tok.skip_ws()
+            # optional comma
+            tok.consume(',')
+            first = False
+        return obj
+    # Identifier value (rare): treat as string
+    ident = tok.parse_identifier()
+    if ident is not None:
+        return ident
+    return None
+
+
+def parse_sandbox_vars(text: str) -> Dict[str, Any]:
+    """Parse full SandboxVars.lua content into a Python dict for the table assigned to SandboxVars."""
+    clean = _strip_lua_comments(text)
+    table_src = _find_sandbox_table(clean)
+    if not table_src:
+        return {}
+    tok = _LuaTok(table_src)
+    val = _parse_lua_value(tok)
+    return val if isinstance(val, dict) else {}
+
+
+def serialize_lua(obj: Any, indent: int = 0) -> str:
+    space = '    ' * indent
+    if isinstance(obj, bool):
+        return 'true' if obj else 'false'
+    if isinstance(obj, (int, float)):
+        return str(obj)
+    if isinstance(obj, str):
+        # Escape backslashes and quotes minimally
+        s = obj.replace('\\', '\\\\').replace('"', '\\"')
+        return f'"{s}"'
+    if isinstance(obj, dict):
+        items = []
+        for k, v in obj.items():
+            key = k if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", k) else f'"{k}"'
+            items.append(f"{space}    {key} = {serialize_lua(v, indent+1)}")
+        inner = ",\n".join(items)
+        return "{\n" + inner + ("\n" + space if items else "") + "}"
+    # Fallback: string
+    return serialize_lua(str(obj), indent)
+
+
+def load_sandbox_vars(path: str) -> Tuple[bool, Dict[str, Any], str]:
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            text = f.read()
+        data = parse_sandbox_vars(text)
+        if not data:
+            return False, {}, "Could not parse SandboxVars table."
+        return True, data, "Loaded SandboxVars."
+    except Exception as e:
+        return False, {}, f"Failed to read: {e}"
+
+
+def save_sandbox_vars(path: str, data: Dict[str, Any]) -> Tuple[bool, str]:
+    try:
+        # Backup
+        try:
+            import shutil
+            shutil.copy2(path, path + '.bak')
+        except Exception:
+            pass
+        body = serialize_lua(data, indent=0)
+        content = "SandboxVars = " + body + "\n"
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return True, "SandboxVars saved (.bak created)."
+    except Exception as e:
+        return False, f"Failed to write: {e}"
+
 
 def parse_collection_children_wsids(html_text: str, parent_wsid: Optional[str] = None) -> List[str]:
     """Extract child workshop item IDs from a Steam Workshop Collection page.
@@ -771,15 +1266,1222 @@ def build_gui():
     root.config(menu=menubar)
     file_menu = tk.Menu(menubar, tearoff=False)
     view_menu = tk.Menu(menubar, tearoff=False)
+    server_menu = tk.Menu(menubar, tearoff=False)
     about_menu = tk.Menu(menubar, tearoff=False)
     menubar.add_cascade(label="File", menu=file_menu)
     menubar.add_cascade(label="View", menu=view_menu)
+    menubar.add_cascade(label="Server Manager", menu=server_menu)
     menubar.add_cascade(label="About", menu=about_menu)
+
+    # Server Manager window opener
+    server_manager_win: Optional[tk.Toplevel] = None
+
+    def open_server_manager_window():
+        nonlocal server_manager_win
+        # If already open, bring to front
+        try:
+            if server_manager_win is not None and server_manager_win.winfo_exists():
+                try:
+                    server_manager_win.deiconify()
+                except Exception:
+                    pass
+                server_manager_win.lift()
+                server_manager_win.focus_force()
+                return
+        except Exception:
+            pass
+
+        # Create a new Server Manager window
+        w = tk.Toplevel(root)
+        w.title("Server Manager")
+        # Roughly theme background to current mode
+        try:
+            w.configure(background=("#1e1e1e" if dark_mode.get() else "#f0f0f0"))
+        except Exception:
+            pass
+        # Size the window to fit more content and maximize on Windows
+        try:
+            sw = w.winfo_screenwidth()
+            sh = w.winfo_screenheight()
+            # Start at ~90% width and ~85% height of the screen, centered
+            ww = max(980, int(sw * 0.9))
+            wh = max(680, int(sh * 0.85))
+            x0 = max(0, (sw - ww) // 2)
+            y0 = max(0, (sh - wh) // 2)
+            w.geometry(f"{ww}x{wh}+{x0}+{y0}")
+            # Minimum size so content isn't cramped if user resizes smaller
+            w.minsize(900, 650)
+            # On Windows, open maximized so everything is visible immediately
+            if sys.platform.startswith("win"):
+                w.state("zoomed")
+        except Exception:
+            w.geometry("1100x800")
+        # Apply background to the toplevel for dark mode consistency
+        try:
+            w.configure(background=CURRENT_THEME.get("bg", "#1e1e1e" if dark_mode.get() else "#f0f0f0"))
+        except Exception:
+            pass
+        server_manager_win = w
+
+        # Track theme trace for cleanup
+        theme_trace_id = None
+
+        # Reset handle when closed
+        def on_close():
+            nonlocal server_manager_win, theme_trace_id
+            try:
+                if theme_trace_id is not None:
+                    try:
+                        dark_mode.trace_remove("write", theme_trace_id)
+                    except Exception:
+                        pass
+                w.destroy()
+            finally:
+                server_manager_win = None
+        w.protocol("WM_DELETE_WINDOW", on_close)
+
+        # Container
+        container = ttk.Frame(w, padding=12)
+        container.pack(fill=tk.BOTH, expand=True)
+        # Use a two-column grid to place SandboxVars (left) and Server INI (right)
+        try:
+            container.grid_columnconfigure(0, weight=1)
+            container.grid_columnconfigure(1, weight=1)
+            container.grid_rowconfigure(0, weight=1)
+        except Exception:
+            pass
+
+        # Shared Server INI path variable and helpers (used by the section below)
+        sm_ini_var = tk.StringVar(value=str(_settings.get("server_ini_path", "")))
+
+        def sm_browse():
+            try:
+                path = filedialog.askopenfilename(
+                    title="Select server INI",
+                    filetypes=[("INI files", "*.ini"), ("All files", "*.*")],
+                )
+            except Exception:
+                path = ""
+            if path:
+                sm_ini_var.set(path)
+                try:
+                    write_settings({"server_ini_path": path})
+                except Exception:
+                    pass
+
+        def sm_open_folder():
+            p = sm_ini_var.get().strip()
+            if not p or not os.path.exists(p):
+                try:
+                    messagebox.showwarning("Open Folder", "Select a valid INI path first.")
+                except Exception:
+                    pass
+                return
+            try:
+                os.startfile(os.path.dirname(p))
+            except Exception as e:
+                try:
+                    messagebox.showerror("Open Folder", f"Failed to open folder: {e}")
+                except Exception:
+                    pass
+
+        # (Removed top-level INI path row UI to avoid redundancy; controls now live in the "Server INI (general)" section.)
+
+        # SandboxVars.lua editor section
+        sbx_frame = ttk.LabelFrame(container, text="SandboxVars.lua", padding=8)
+        try:
+            sbx_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        except Exception:
+            # Fallback to pack if grid is unavailable (should not happen)
+            sbx_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Path row
+        sbx_row = ttk.Frame(sbx_frame)
+        sbx_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(sbx_row, text="SandboxVars.lua:").pack(side=tk.LEFT)
+        # Prefill from saved settings if available
+        sbx_path_var = tk.StringVar(value=str(_settings.get("sandbox_vars_path", "")))
+        sbx_entry = ttk.Entry(sbx_row, textvariable=sbx_path_var)
+        sbx_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8,8))
+        # Persist on focus-out edits
+        try:
+            sbx_entry.bind(
+                "<FocusOut>",
+                lambda e: write_settings({"sandbox_vars_path": sbx_path_var.get().strip()}),
+            )
+        except Exception:
+            pass
+
+        def sbx_browse():
+            try:
+                p = filedialog.askopenfilename(title="Select SandboxVars.lua", filetypes=[("Lua", "*.lua"), ("All files", "*.*")])
+            except Exception:
+                p = ""
+            if p:
+                sbx_path_var.set(p)
+                try:
+                    write_settings({"sandbox_vars_path": p})
+                except Exception:
+                    pass
+                # Auto-load immediately after selecting
+                try:
+                    sbx_load()
+                except Exception:
+                    pass
+
+        ttk.Button(sbx_row, text="Browse…", command=sbx_browse).pack(side=tk.LEFT)
+        
+        # Auto-load on window open if a saved, existing path is present
+        def _auto_load_initial():
+            try:
+                ip = sbx_path_var.get().strip()
+                if ip and os.path.exists(ip):
+                    sbx_load()
+            except Exception:
+                pass
+        try:
+            w.after(150, _auto_load_initial)
+        except Exception:
+            pass
+
+        # Scrollable form for key/value fields
+        form_wrap = ttk.Frame(sbx_frame)
+        form_wrap.pack(fill=tk.BOTH, expand=True)
+        sbx_canvas = tk.Canvas(form_wrap, highlightthickness=0, bg=CURRENT_THEME.get("bg", "#1e1e1e" if dark_mode.get() else "#f0f0f0"))
+        sbx_scroll = ttk.Scrollbar(form_wrap, orient="vertical", command=sbx_canvas.yview)
+        sbx_inner = ttk.Frame(sbx_canvas)
+        sbx_inner_id = sbx_canvas.create_window((0, 0), window=sbx_inner, anchor="nw")
+        sbx_canvas.configure(yscrollcommand=sbx_scroll.set)
+        # Slightly larger scroll increments for smoother feel
+        try:
+            sbx_canvas.configure(yscrollincrement=24)
+        except Exception:
+            pass
+        sbx_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sbx_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _sbx_update_wrap(event=None):
+            """Update wraplength for SandboxVars description labels based on available width.
+            Uses a cached width to avoid recalculating on every Configure/scroll event."""
+            try:
+                if getattr(w, "_is_resizing", False):
+                    return
+                avail = max(120, sbx_canvas.winfo_width() - 24)
+                last = getattr(sbx_canvas, "_last_wrap", None)
+                if last is not None and abs(avail - last) < 16:
+                    return
+                setattr(sbx_canvas, "_last_wrap", avail)
+                for child in sbx_inner.winfo_children():
+                    pass
+                # Use tracked description labels for efficiency
+                try:
+                    for lab in list(sbx_desc_labels):
+                        lab.configure(wraplength=avail, justify="left")
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        def _sbx_apply_layout():
+            try:
+                sbx_canvas.configure(scrollregion=sbx_canvas.bbox("all"))
+                sbx_canvas.itemconfig(sbx_inner_id, width=sbx_canvas.winfo_width())
+                _sbx_update_wrap()
+            except Exception:
+                pass
+
+        def _sbx_schedule_layout(event=None):
+            # Debounce to coalesce rapid Configure events
+            try:
+                if getattr(w, "_is_resizing", False):
+                    return
+                prev = getattr(sbx_canvas, "_layout_after", None)
+                if prev is not None:
+                    w.after_cancel(prev)
+            except Exception:
+                pass
+            try:
+                aid = w.after(200, _sbx_apply_layout)
+                setattr(sbx_canvas, "_layout_after", aid)
+            except Exception:
+                _sbx_apply_layout()
+
+        sbx_inner.bind("<Configure>", _sbx_schedule_layout)
+        sbx_canvas.bind("<Configure>", _sbx_schedule_layout)
+
+        # Mouse wheel scrolling (Windows/Mac/Linux) limited to this frame
+        def _sbx_bounce(direction: str):
+            try:
+                if getattr(sbx_canvas, "_bounce_animating", False):
+                    return
+                setattr(sbx_canvas, "_bounce_animating", True)
+                coords = sbx_canvas.coords(sbx_inner_id) or [0, 0]
+                base_x = coords[0] if len(coords) >= 1 else 0
+                base_y = coords[1] if len(coords) >= 2 else 0
+                offset = 12
+                peak = (base_y + offset) if direction == "top" else (base_y - offset)
+                # Quick spring-like sequence towards peak then back to base
+                seq = (0.6, 1.0, 0.6, 0.3, 0.0)
+                frames = [base_y + (peak - base_y) * f for f in seq]
+                idx = 0
+
+                def _step():
+                    nonlocal idx
+                    if idx >= len(frames):
+                        try:
+                            sbx_canvas.coords(sbx_inner_id, base_x, base_y)
+                        except Exception:
+                            pass
+                        setattr(sbx_canvas, "_bounce_animating", False)
+                        return
+                    try:
+                        sbx_canvas.coords(sbx_inner_id, base_x, frames[idx])
+                    except Exception:
+                        setattr(sbx_canvas, "_bounce_animating", False)
+                        return
+                    idx += 1
+                    try:
+                        sbx_canvas.after(18, _step)
+                    except Exception:
+                        try:
+                            w.after(18, _step)
+                        except Exception:
+                            pass
+
+                _step()
+            except Exception:
+                try:
+                    setattr(sbx_canvas, "_bounce_animating", False)
+                except Exception:
+                    pass
+
+        def _wheel_in_sbx(event) -> bool:
+            try:
+                w = sbx_frame.winfo_containing(event.x_root, event.y_root)
+                if not w:
+                    return False
+                while w is not None:
+                    if w == sbx_frame:
+                        return True
+                    parent = w.winfo_parent()
+                    if not parent:
+                        break
+                    w = w.nametowidget(parent)
+            except Exception:
+                return False
+            return False
+
+        def _on_mousewheel(event):
+            if not _wheel_in_sbx(event):
+                return
+            try:
+                delta = int(-1 * (event.delta / 120)) if event.delta else 0
+            except Exception:
+                delta = 0
+            if delta:
+                try:
+                    first, last = sbx_canvas.yview()
+                except Exception:
+                    first, last = (0.0, 1.0)
+                # Clamp at edges and trigger bounce
+                if delta < 0 and first <= 0.0:
+                    _sbx_bounce("top"); return
+                if delta > 0 and last >= 1.0:
+                    _sbx_bounce("bottom"); return
+                sbx_canvas.yview_scroll(delta, "units")
+
+        def _on_mousewheel_linux_up(event):
+            if _wheel_in_sbx(event):
+                try:
+                    first, _last = sbx_canvas.yview()
+                except Exception:
+                    first, _last = (0.0, 1.0)
+                if first <= 0.0:
+                    _sbx_bounce("top"); return
+                sbx_canvas.yview_scroll(-1, "units")
+
+        def _on_mousewheel_linux_down(event):
+            if _wheel_in_sbx(event):
+                try:
+                    _first, last = sbx_canvas.yview()
+                except Exception:
+                    _first, last = (0.0, 1.0)
+                if last >= 1.0:
+                    _sbx_bounce("bottom"); return
+                sbx_canvas.yview_scroll(1, "units")
+
+        try:
+            # Windows / macOS
+            sbx_canvas.bind_all("<MouseWheel>", _on_mousewheel, add="+")
+            # Linux
+            sbx_canvas.bind_all("<Button-4>", _on_mousewheel_linux_up, add="+")
+            sbx_canvas.bind_all("<Button-5>", _on_mousewheel_linux_down, add="+")
+        except Exception:
+            pass
+
+        # Holds per-key control variables and kinds
+        sbx_controls: Dict[str, Tuple[tk.Variable, str]] = {}
+        # Track description labels for faster wrap updates
+        sbx_desc_labels: list = []
+
+        # Action buttons
+        sbx_actions = ttk.Frame(sbx_frame)
+        sbx_actions.pack(fill=tk.X, pady=(6, 0))
+
+        def sbx_load():
+            p = sbx_path_var.get().strip()
+            if not p or not os.path.exists(p):
+                try:
+                    messagebox.showwarning("SandboxVars", "Select a valid SandboxVars.lua path.")
+                except Exception:
+                    pass
+                return
+            ok, data, msg = load_sandbox_vars(p)
+            if not ok:
+                try:
+                    messagebox.showerror("SandboxVars", msg)
+                except Exception:
+                    pass
+                return
+            # Persist last used path
+            try:
+                write_settings({"sandbox_vars_path": p})
+            except Exception:
+                pass
+            # Clear existing form
+            for child in list(sbx_inner.children.values()):
+                try:
+                    child.destroy()
+                except Exception:
+                    pass
+            sbx_controls.clear()
+            try:
+                sbx_desc_labels.clear()
+            except Exception:
+                pass
+            # Build rows
+            row = 0
+            desc_fg = CURRENT_THEME.get("desc_fg", "#9e9e9e" if dark_mode.get() else "#666666")
+            for k, v in data.items():
+                # Key label
+                ttk.Label(sbx_inner, text=k).grid(row=row, column=0, sticky="w", padx=(0,8))
+                # Value widget by type
+                if isinstance(v, bool):
+                    # Use the same ToggleSwitch pill as in the INI section (left=False/red, right=True/green)
+                    bval = 1 if bool(v) else 0
+                    var = tk.IntVar(value=bval)
+                    val_wrap = ttk.Frame(sbx_inner)
+                    val_wrap.grid(row=row, column=1, sticky="w", pady=(1,1))
+                    try:
+                        toggle = ToggleSwitch(val_wrap, variable=var, width=56, height=24)
+                        toggle.pack(side=tk.LEFT)
+                    except Exception:
+                        # Fallback to a simple checkbutton if ToggleSwitch isn't available
+                        ttk.Checkbutton(val_wrap, variable=var).pack(side=tk.LEFT)
+                    # Text label to the right reflecting current value
+                    bool_lbl = ttk.Label(val_wrap, text=("True" if bval == 1 else "False"))
+                    bool_lbl.pack(side=tk.LEFT, padx=(8,0))
+                    try:
+                        var.trace_add("write", lambda *a, v=var, L=bool_lbl: L.configure(text=("True" if int(v.get())==1 else "False")))
+                    except Exception:
+                        pass
+                    kind = 'bool'
+                elif isinstance(v, (int, float)):
+                    var = tk.StringVar(value=str(v))
+                    entry = ttk.Entry(sbx_inner, textvariable=var, width=18)
+                    entry.grid(row=row, column=1, sticky="w")
+                    kind = 'number'
+                elif isinstance(v, dict):
+                    # Represent nested as JSON string
+                    var = tk.StringVar(value=json.dumps(v))
+                    entry = ttk.Entry(sbx_inner, textvariable=var)
+                    entry.grid(row=row, column=1, sticky="ew")
+                    kind = 'json'
+                else:
+                    var = tk.StringVar(value=str(v))
+                    entry = ttk.Entry(sbx_inner, textvariable=var)
+                    entry.grid(row=row, column=1, sticky="ew")
+                    kind = 'string'
+                sbx_controls[k] = (var, kind)
+                # Description (second line)
+                d = get_description("sandbox", k, SANDBOX_DESCRIPTIONS.get(k, k))
+                # Description labels wrap and left-justify within available width
+                lab = ttk.Label(
+                    sbx_inner,
+                    text=d,
+                    style="SandboxDesc.TLabel",
+                    wraplength=max(120, sbx_canvas.winfo_width() - 24),
+                    justify="left",
+                )
+                # Keep track for efficient wrap updates; allow editing description on double-click
+                try:
+                    sbx_desc_labels.append(lab)
+                except Exception:
+                    pass
+                # Allow editing description on double-click
+                def _edit_sbx_desc(event, key=k, label_ref=lambda lab=lab: lab):
+                    try:
+                        import tkinter.simpledialog as sd
+                        cur = label_ref().cget("text")
+                        new = sd.askstring("Edit Description", f"Sandbox key: {key}\n\nDescription:", initialvalue=cur, parent=w)
+                        if new is not None:
+                            if set_description("sandbox", key, new):
+                                # Update label and reload overrides to keep in sync
+                                label_ref().configure(text=new)
+                                reload_descriptions()
+                    except Exception:
+                        pass
+                try:
+                    lab.bind("<Double-Button-1>", _edit_sbx_desc)
+                except Exception:
+                    pass
+                lab.grid(row=row+1, column=0, columnspan=2, sticky="w", pady=(0,6))
+                row += 2
+            # Columns sizing
+            sbx_inner.columnconfigure(0, weight=0)
+            sbx_inner.columnconfigure(1, weight=1)
+
+        def sbx_save():
+            p = sbx_path_var.get().strip()
+            if not p:
+                try:
+                    messagebox.showwarning("SandboxVars", "Select a SandboxVars.lua path first.")
+                except Exception:
+                    pass
+                return
+            # Collect data from form controls
+            data: Dict[str, Any] = {}
+            for key, (var, kind) in sbx_controls.items():
+                if kind == 'bool':
+                    try:
+                        data[key] = bool(int(var.get()))
+                    except Exception:
+                        data[key] = bool(var.get())
+                elif kind == 'number':
+                    sval = str(var.get()).strip()
+                    try:
+                        data[key] = int(sval) if re.fullmatch(r"[-+]?\d+", sval) else float(sval)
+                    except Exception:
+                        data[key] = sval
+                elif kind == 'json':
+                    sval = str(var.get()).strip()
+                    try:
+                        data[key] = json.loads(sval)
+                    except Exception:
+                        data[key] = sval
+                else:
+                    data[key] = str(var.get())
+            ok, msg = save_sandbox_vars(p, data)
+            try:
+                if ok:
+                    messagebox.showinfo("SandboxVars", msg)
+                else:
+                    messagebox.showerror("SandboxVars", msg)
+            except Exception:
+                pass
+
+        ttk.Button(sbx_actions, text="Load", command=sbx_load).pack(side=tk.LEFT)
+        ttk.Button(sbx_actions, text="Save", command=sbx_save).pack(side=tk.LEFT, padx=(8,0))
+        
+        # Live theme sync for this window
+        def _sm_sync_theme(*_args):
+            try:
+                w.configure(background=CURRENT_THEME.get("bg", "#1e1e1e" if dark_mode.get() else "#f0f0f0"))
+                sbx_canvas.configure(bg=CURRENT_THEME.get("bg", "#1e1e1e" if dark_mode.get() else "#f0f0f0"))
+            except Exception:
+                pass
+        try:
+            theme_trace_id = dark_mode.trace_add("write", lambda *a: _sm_sync_theme())
+        except Exception:
+            pass
+
+        # --- Server INI editor section (general key/value form) ---
+        ini_form_frame = ttk.LabelFrame(container, text="Server INI (general)", padding=8)
+        try:
+            ini_form_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        except Exception:
+            ini_form_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+
+        # Path row (reuse the top server INI path var, sm_ini_var)
+        ini2_row = ttk.Frame(ini_form_frame)
+        ini2_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(ini2_row, text="Server INI:").pack(side=tk.LEFT)
+        ini2_entry = ttk.Entry(ini2_row, textvariable=sm_ini_var)
+        ini2_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8))
+        try:
+            ini2_entry.bind(
+                "<FocusOut>",
+                lambda e: write_settings({"server_ini_path": sm_ini_var.get().strip()}),
+            )
+        except Exception:
+            pass
+        ttk.Button(ini2_row, text="Browse…", command=sm_browse).pack(side=tk.LEFT)
+        ttk.Button(ini2_row, text="Open Folder", command=sm_open_folder).pack(side=tk.LEFT, padx=(6, 0))
+
+        # Scrollable form
+        ini_form_wrap = ttk.Frame(ini_form_frame)
+        ini_form_wrap.pack(fill=tk.BOTH, expand=True)
+        ini_canvas = tk.Canvas(ini_form_wrap, highlightthickness=0, bg=CURRENT_THEME.get("bg", "#1e1e1e" if dark_mode.get() else "#f0f0f0"))
+        ini_scroll = ttk.Scrollbar(ini_form_wrap, orient="vertical", command=ini_canvas.yview)
+        ini_inner = ttk.Frame(ini_canvas)
+        ini_inner_id = ini_canvas.create_window((0, 0), window=ini_inner, anchor="nw")
+        ini_canvas.configure(yscrollcommand=ini_scroll.set)
+        # Track INI description labels for faster wrap updates
+        ini_desc_labels: list = []
+        try:
+            ini_canvas.configure(yscrollincrement=24)
+        except Exception:
+            pass
+        ini_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ini_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _ini_update_wrap(event=None):
+            """Update wraplength for INI description labels based on available width.
+            Uses a cached width to avoid recalculating on every Configure/scroll event."""
+            try:
+                if getattr(w, "_is_resizing", False):
+                    return
+                avail = max(140, ini_canvas.winfo_width() - 24)
+                last = getattr(ini_canvas, "_last_wrap", None)
+                if last is not None and abs(avail - last) < 16:
+                    return
+                setattr(ini_canvas, "_last_wrap", avail)
+                for lab in list(ini_desc_labels):
+                    try:
+                        lab.configure(wraplength=avail, justify="left")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        def _ini_apply_layout():
+            try:
+                ini_canvas.configure(scrollregion=ini_canvas.bbox("all"))
+                ini_canvas.itemconfig(ini_inner_id, width=ini_canvas.winfo_width())
+                _ini_update_wrap()
+            except Exception:
+                pass
+
+        def _ini_schedule_layout(event=None):
+            try:
+                if getattr(w, "_is_resizing", False):
+                    return
+                prev = getattr(ini_canvas, "_layout_after", None)
+                if prev is not None:
+                    w.after_cancel(prev)
+            except Exception:
+                pass
+            try:
+                aid = w.after(60, _ini_apply_layout)
+                setattr(ini_canvas, "_layout_after", aid)
+            except Exception:
+                _ini_apply_layout()
+        ini_inner.bind("<Configure>", _ini_schedule_layout)
+        ini_canvas.bind("<Configure>", _ini_schedule_layout)
+
+        # During active resize, skip expensive wrap updates and disable toggle animations
+        def _ini_bounce(direction: str):
+            try:
+                if getattr(ini_canvas, "_bounce_animating", False):
+                    return
+                setattr(ini_canvas, "_bounce_animating", True)
+                coords = ini_canvas.coords(ini_inner_id) or [0, 0]
+                base_x = coords[0] if len(coords) >= 1 else 0
+                base_y = coords[1] if len(coords) >= 2 else 0
+                offset = 12
+                peak = (base_y + offset) if direction == "top" else (base_y - offset)
+                seq = (0.6, 1.0, 0.6, 0.3, 0.0)
+                frames = [base_y + (peak - base_y) * f for f in seq]
+                idx = 0
+
+                def _step():
+                    nonlocal idx
+                    if idx >= len(frames):
+                        try:
+                            ini_canvas.coords(ini_inner_id, base_x, base_y)
+                        except Exception:
+                            pass
+                        setattr(ini_canvas, "_bounce_animating", False)
+                        return
+                    try:
+                        ini_canvas.coords(ini_inner_id, base_x, frames[idx])
+                    except Exception:
+                        setattr(ini_canvas, "_bounce_animating", False)
+                        return
+                    idx += 1
+                    try:
+                        ini_canvas.after(18, _step)
+                    except Exception:
+                        try:
+                            w.after(18, _step)
+                        except Exception:
+                            pass
+
+                _step()
+            except Exception:
+                try:
+                    setattr(ini_canvas, "_bounce_animating", False)
+                except Exception:
+                    pass
+
+        # Debounced resize handling so initial show finalizes layout automatically
+        def _finish_resize():
+            setattr(w, "_is_resizing", False)
+            try:
+                for child in w.winfo_children():
+                    try:
+                        for sub in child.winfo_children():
+                            if isinstance(sub, ToggleSwitch):
+                                sub.anim_enabled = True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                _sbx_apply_layout(); _ini_apply_layout()
+            except Exception:
+                pass
+
+        def _on_window_configure(_e=None):
+            setattr(w, "_is_resizing", True)
+            try:
+                for child in w.winfo_children():
+                    try:
+                        for sub in child.winfo_children():
+                            if isinstance(sub, ToggleSwitch):
+                                sub.anim_enabled = False
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                prev = getattr(w, "_resize_after", None)
+                if prev is not None:
+                    w.after_cancel(prev)
+            except Exception:
+                pass
+            try:
+                aid = w.after(180, _finish_resize)
+                setattr(w, "_resize_after", aid)
+            except Exception:
+                pass
+
+        try:
+            w.bind("<Configure>", _on_window_configure, add="+")
+            w.bind("<ButtonRelease-1>", lambda e: _finish_resize(), add="+")
+        except Exception:
+            pass
+
+        # Mouse wheel over this frame
+        def _wheel_in_ini(event) -> bool:
+            try:
+                wdg = ini_form_frame.winfo_containing(event.x_root, event.y_root)
+                if not wdg:
+                    return False
+                while wdg is not None:
+                    if wdg == ini_form_frame:
+                        return True
+                    parent = wdg.winfo_parent()
+                    if not parent:
+                        break
+                    wdg = wdg.nametowidget(parent)
+            except Exception:
+                return False
+            return False
+        def _on_ini_mousewheel(event):
+            if not _wheel_in_ini(event):
+                return
+            try:
+                delta = int(-1 * (event.delta / 120)) if event.delta else 0
+            except Exception:
+                delta = 0
+            if delta:
+                try:
+                    first, last = ini_canvas.yview()
+                except Exception:
+                    first, last = (0.0, 1.0)
+                if delta < 0 and first <= 0.0:
+                    _ini_bounce("top"); return
+                if delta > 0 and last >= 1.0:
+                    _ini_bounce("bottom"); return
+                ini_canvas.yview_scroll(delta, "units")
+        def _on_ini_mousewheel_linux_up(event):
+            if _wheel_in_ini(event):
+                try:
+                    first, _last = ini_canvas.yview()
+                except Exception:
+                    first, _last = (0.0, 1.0)
+                if first <= 0.0:
+                    _ini_bounce("top"); return
+                ini_canvas.yview_scroll(-1, "units")
+        def _on_ini_mousewheel_linux_down(event):
+            if _wheel_in_ini(event):
+                try:
+                    _first, last = ini_canvas.yview()
+                except Exception:
+                    _first, last = (0.0, 1.0)
+                if last >= 1.0:
+                    _ini_bounce("bottom"); return
+                ini_canvas.yview_scroll(1, "units")
+        try:
+            ini_canvas.bind_all("<MouseWheel>", _on_ini_mousewheel, add="+")
+            ini_canvas.bind_all("<Button-4>", _on_ini_mousewheel_linux_up, add="+")
+            ini_canvas.bind_all("<Button-5>", _on_ini_mousewheel_linux_down, add="+")
+        except Exception:
+            pass
+
+        # Canvas-based toggle switch (left=False red, right=True green)
+        class ToggleSwitch(ttk.Frame):
+            def __init__(self, master, variable: tk.IntVar, width: int = 64, height: int = 28):
+                super().__init__(master)
+                self.var = variable
+                self.w = width
+                self.h = height
+                self.anim_enabled = True
+                self.knob_margin = 2
+                self.bg_color = CURRENT_THEME.get("bg", "#1e1e1e" if dark_mode.get() else "#f0f0f0")
+                self.on_color = "#2ecc71"  # green
+                self.off_color = "#e74c3c"  # red
+                # Use a borderless canvas to avoid halo/lines
+                # Add extra vertical pixels to avoid clip at the bottom
+                self.canvas = tk.Canvas(self, width=self.w, height=self.h + 4, highlightthickness=0, bg=self.bg_color, bd=0)
+                self.canvas.pack(fill=tk.BOTH, expand=True)
+                # Interactions
+                self.canvas.bind("<Button-1>", self._toggle)
+                self.canvas.bind("<Configure>", lambda e: self._redraw())
+                try:
+                    self._trace_id = self.var.trace_add("write", lambda *a: self._redraw())
+                except Exception:
+                    self._trace_id = None
+                # Animation state
+                self._anim_active = False
+                self._anim_cx = None
+                self._anim_after = None
+                self._redraw()
+
+            def destroy(self):
+                try:
+                    if getattr(self, "_trace_id", None):
+                        self.var.trace_remove("write", self._trace_id)
+                    if getattr(self, "_anim_after", None):
+                        try:
+                            self.after_cancel(self._anim_after)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                return super().destroy()
+
+            def _toggle(self, _evt=None):
+                # Animate knob sliding while immediately updating the value
+                try:
+                    v = int(self.var.get())
+                except Exception:
+                    v = 0
+                target = 0 if v == 1 else 1
+                # Compute start/end positions
+                r = self.h // 2
+                start_cx = (self.w - r) if v == 1 else r
+                end_cx = (self.w - r) if target == 1 else r
+                # If animation disabled (e.g., during resize), jump directly
+                if not getattr(self, "anim_enabled", True):
+                    try:
+                        self.var.set(target)
+                    except Exception:
+                        pass
+                    self._anim_active = False
+                    self._anim_cx = None
+                    self._redraw()
+                    return
+                self._anim_active = True
+                self._anim_cx = start_cx
+                # Cancel any existing animation
+                if getattr(self, "_anim_after", None):
+                    try:
+                        self.after_cancel(self._anim_after)
+                    except Exception:
+                        pass
+                # Set the target state immediately (so bound labels update), then animate
+                try:
+                    self.var.set(target)
+                except Exception:
+                    pass
+                self._animate_to(end_cx)
+
+            def _animate_to(self, end_cx: int):
+                # Simple linear tween over ~120ms with ~10 frames
+                frames = 10
+                duration_ms = 120
+                step_ms = max(10, duration_ms // frames)
+                if not getattr(self, "anim_enabled", True):
+                    # Jump directly without animating
+                    self._anim_active = False
+                    self._anim_cx = None
+                    self._redraw()
+                    return
+                try:
+                    cur = float(self._anim_cx) if self._anim_cx is not None else end_cx
+                except Exception:
+                    cur = float(end_cx)
+                delta = (end_cx - cur) / max(1, frames)
+
+                def _step():
+                    nonlocal cur, delta, end_cx
+                    # Advance
+                    cur += delta
+                    # Snap if close
+                    if (delta >= 0 and cur >= end_cx) or (delta < 0 and cur <= end_cx):
+                        cur = float(end_cx)
+                        self._anim_cx = None
+                        self._anim_active = False
+                        self._redraw()
+                        return
+                    self._anim_cx = cur
+                    self._redraw()
+                    try:
+                        self._anim_after = self.after(step_ms, _step)
+                    except Exception:
+                        # Fallback: end animation
+                        self._anim_cx = None
+                        self._anim_active = False
+                        self._redraw()
+
+                _step()
+
+            def _rounded_pill(self, x0, y0, x1, y1, r, fill):
+                """Draw a seam-free rounded pill using overlapping filled shapes without outlines."""
+                c = self.canvas
+                # Mid section
+                c.create_rectangle(x0 + r, y0, x1 - r, y1, fill=fill, outline="")
+                # Left and right caps (overlap slightly to avoid visible seams)
+                c.create_oval(x0, y0, x0 + 2*r + 0.5, y0 + 2*r + 0.5, fill=fill, outline="")
+                c.create_oval(x1 - 2*r - 0.5, y0, x1, y0 + 2*r + 0.5, fill=fill, outline="")
+
+            def _redraw(self):
+                c = self.canvas
+                c.delete("all")
+                w, h = self.w, self.h
+                r = h // 2
+                try:
+                    v = int(self.var.get())
+                except Exception:
+                    v = 0
+                # Background color depends on value; True (1) green, False (0) red
+                bg_fill = self.on_color if v == 1 else self.off_color
+                # Draw a seam-free pill background slightly lowered to avoid clip
+                y0_top = 2
+                self._rounded_pill(1, y0_top, w-1, (y0_top + 2*r), r, fill=bg_fill)
+                # Knob position: left for False, right for True
+                knob_r = r - self.knob_margin
+                if self._anim_active and self._anim_cx is not None:
+                    cx = int(self._anim_cx)
+                else:
+                    cx = (w - r) if v == 1 else r
+                cy = y0_top + r
+                # Subtle drop shadow behind knob
+                try:
+                    c.create_oval(cx - knob_r + 1, cy - knob_r + 2, cx + knob_r + 1, cy + knob_r + 2, fill="#000000", outline="", stipple="gray50")
+                except Exception:
+                    pass
+                # Draw knob with subtle border to stand out, no seams
+                knob_outline = "#3c3c3c" if dark_mode.get() else "#c8c8c8"
+                c.create_oval(cx - knob_r, cy - knob_r, cx + knob_r, cy + knob_r, fill="#f5f5f5", outline=knob_outline)
+
+        # Controls store
+        ini_controls: Dict[str, Tuple[tk.Variable, str]] = {}
+        # Helper: add or update a single key in the form
+        def ini_add_or_update_field(key: str, value: str):
+            k = key
+            v = str(value)
+            # Update if exists
+            for existing in list(ini_controls.keys()):
+                if existing.lower() == k.lower():
+                    var, kind = ini_controls[existing]
+                    if kind == 'bool':
+                        lv = v.strip().lower()
+                        # Only textual booleans should remain boolean; otherwise convert to string entry
+                        if (k.lower() not in SERVER_INI_FORCE_NUMBER_KEYS) and (lv in {"true","yes","on","false","no","off"}):
+                            try:
+                                var.set(1 if lv in {"true","yes","on"} else 0)
+                            except Exception:
+                                pass
+                        else:
+                            # Convert this control to an Entry (string)
+                            try:
+                                # Find the widgets on this row: they will be destroyed when rebuilding on full load
+                                pass
+                            except Exception:
+                                pass
+                            # Update control mapping to string
+                            sval = str(value)
+                            ini_controls.pop(existing, None)
+                            # Place a new Entry at the next available row
+                            rnew = len(ini_controls) * 2
+                            ttk.Label(ini_inner, text=k).grid(row=rnew, column=0, sticky="w", padx=(0,8))
+                            s_var = tk.StringVar(value=sval)
+                            s_ent = ttk.Entry(ini_inner, textvariable=s_var)
+                            s_ent.grid(row=rnew, column=1, sticky="ew")
+                            ini_controls[k] = (s_var, 'string')
+                            dsc = get_description("ini", k, SERVER_INI_DESCRIPTIONS.get(k, k))
+                            dlab = ttk.Label(ini_inner, text=dsc, style="SandboxDesc.TLabel", wraplength=max(140, ini_canvas.winfo_width() - 24), justify="left")
+                            dlab.grid(row=rnew+1, column=0, columnspan=2, sticky="w", pady=(0,6))
+                    else:
+                        try:
+                            var.set(v)
+                        except Exception:
+                            pass
+                    return
+            # Add new row at the end as string entry
+            r = len(ini_controls) * 2
+            ttk.Label(ini_inner, text=k).grid(row=r, column=0, sticky="w", padx=(0,8))
+            var = tk.StringVar(value=v)
+            ent = ttk.Entry(ini_inner, textvariable=var)
+            ent.grid(row=r, column=1, sticky="ew")
+            ini_controls[k] = (var, 'string')
+            # Description line
+            desc = get_description("ini", k, SERVER_INI_DESCRIPTIONS.get(k, k))
+            lab = ttk.Label(ini_inner, text=desc, style="SandboxDesc.TLabel", wraplength=max(140, ini_canvas.winfo_width() - 24), justify="left")
+            lab.grid(row=r+1, column=0, columnspan=2, sticky="w", pady=(0,6))
+            def _edit_ini_desc(event, key=k, label_ref=lambda lab=lab: lab):
+                try:
+                    import tkinter.simpledialog as sd
+                    cur = label_ref().cget("text")
+                    new = sd.askstring("Edit Description", f"INI key: {key}\n\nDescription:", initialvalue=cur, parent=w)
+                    if new is not None:
+                        if set_description("ini", key, new):
+                            label_ref().configure(text=new)
+                            reload_descriptions()
+                except Exception:
+                    pass
+            try:
+                lab.bind("<Double-Button-1>", _edit_ini_desc)
+            except Exception:
+                pass
+
+        # Actions
+        ini_actions = ttk.Frame(ini_form_frame)
+        ini_actions.pack(fill=tk.X, pady=(6, 0))
+
+        def ini_get_public_ipv4():
+            # Fetch public IPv4 from common endpoints
+            urls = [
+                "https://api.ipify.org?format=text",
+                "https://ipv4.icanhazip.com/",
+                "https://checkip.amazonaws.com/",
+            ]
+            ua = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+            ip_text = None
+            for u in urls:
+                try:
+                    req = urllib.request.Request(u, headers={"User-Agent": ua})
+                    with urllib.request.urlopen(req, timeout=6) as resp:
+                        raw = resp.read().decode("utf-8", errors="ignore").strip()
+                        # Keep only first token per line
+                        ip_candidate = raw.split()[0]
+                        addr = ipaddress.ip_address(ip_candidate)
+                        if addr.version == 4:
+                            ip_text = str(addr)
+                            break
+                except Exception:
+                    continue
+            if not ip_text:
+                try:
+                    messagebox.showerror("Public IPv4", "Could not determine public IPv4 address.")
+                except Exception:
+                    pass
+                return
+            # Update or add the field in the form
+            ini_add_or_update_field("server_browser_announced_ip", ip_text)
+            try:
+                messagebox.showinfo("Public IPv4", f"Detected public IPv4: {ip_text}\nIt has been placed into server_browser_announced_ip.")
+            except Exception:
+                pass
+
+        def ini_load():
+            p = sm_ini_var.get().strip()
+            if not p or not os.path.exists(p):
+                try:
+                    messagebox.showwarning("Server INI", "Select a valid server INI path.")
+                except Exception:
+                    pass
+                return
+            ok, data, msg, orig_lines = parse_server_ini_all(p)
+            if not ok:
+                try:
+                    messagebox.showerror("Server INI", msg)
+                except Exception:
+                    pass
+                return
+            # Persist path
+            try:
+                write_settings({"server_ini_path": p})
+            except Exception:
+                pass
+            # Clear existing rows
+            for child in list(ini_inner.children.values()):
+                try:
+                    child.destroy()
+                except Exception:
+                    pass
+            ini_controls.clear()
+            # Build rows: key label, value widget (custom toggle for booleans) and description line
+            r = 0
+            for k, v in data.items():
+                ttk.Label(ini_inner, text=k).grid(row=r, column=0, sticky="w", padx=(0,8))
+                sval = str(v).strip()
+                low = sval.lower()
+                if (low in {"true", "false", "yes", "no", "on", "off"}) and (k.lower() not in SERVER_INI_FORCE_NUMBER_KEYS):
+                    # Treat as boolean using custom toggle switch (left=False red, right=True green)
+                    bval = 1 if low in {"true", "1", "yes", "on"} else 0
+                    bvar = tk.IntVar(value=bval)
+                    # Value wrapper so the label sits right next to the pill
+                    _valwrap = ttk.Frame(ini_inner)
+                    _valwrap.grid(row=r, column=1, sticky="w", pady=(1,1))
+                    toggle = ToggleSwitch(_valwrap, variable=bvar, width=56, height=24)
+                    toggle.pack(side=tk.LEFT)
+                    # Text label to the right reflecting current value
+                    bool_lbl = ttk.Label(_valwrap, text=("True" if bval == 1 else "False"))
+                    bool_lbl.pack(side=tk.LEFT, padx=(8,0))
+                    try:
+                        bvar.trace_add("write", lambda *a, v=bvar, L=bool_lbl: L.configure(text=("True" if int(v.get())==1 else "False")))
+                    except Exception:
+                        pass
+                    ini_controls[k] = (bvar, 'bool')
+                    # Description line across 2 columns
+                    desc = get_description("ini", k, SERVER_INI_DESCRIPTIONS.get(k, k))
+                    lab = ttk.Label(
+                        ini_inner,
+                        text=desc,
+                        style="SandboxDesc.TLabel",
+                        wraplength=max(140, ini_canvas.winfo_width() - 24),
+                        justify="left",
+                    )
+                    try:
+                        ini_desc_labels.append(lab)
+                    except Exception:
+                        pass
+                    lab.grid(row=r+1, column=0, columnspan=2, sticky="w", pady=(0,6))
+                    def _edit_ini_desc_bool(event, key=k, label_ref=lambda lab=lab: lab):
+                        try:
+                            import tkinter.simpledialog as sd
+                            cur = label_ref().cget("text")
+                            new = sd.askstring("Edit Description", f"INI key: {key}\n\nDescription:", initialvalue=cur, parent=w)
+                            if new is not None:
+                                if set_description("ini", key, new):
+                                    label_ref().configure(text=new)
+                                    reload_descriptions()
+                        except Exception:
+                            pass
+                    try:
+                        lab.bind("<Double-Button-1>", _edit_ini_desc_bool)
+                    except Exception:
+                        pass
+                    r += 2
+                else:
+                    var = tk.StringVar(value=sval)
+                    ent = ttk.Entry(ini_inner, textvariable=var)
+                    ent.grid(row=r, column=1, sticky="ew")
+                    ini_controls[k] = (var, 'string')
+                    # Description line under the field
+                    desc = get_description("ini", k, SERVER_INI_DESCRIPTIONS.get(k, k))
+                    lab = ttk.Label(
+                        ini_inner,
+                        text=desc,
+                        style="SandboxDesc.TLabel",
+                        wraplength=max(140, ini_canvas.winfo_width() - 24),
+                        justify="left",
+                    )
+                    try:
+                        ini_desc_labels.append(lab)
+                    except Exception:
+                        pass
+                    lab.grid(row=r+1, column=0, columnspan=2, sticky="w", pady=(0,6))
+                    def _edit_ini_desc_str(event, key=k, label_ref=lambda lab=lab: lab):
+                        try:
+                            import tkinter.simpledialog as sd
+                            cur = label_ref().cget("text")
+                            new = sd.askstring("Edit Description", f"INI key: {key}\n\nDescription:", initialvalue=cur, parent=w)
+                            if new is not None:
+                                if set_description("ini", key, new):
+                                    label_ref().configure(text=new)
+                                    reload_descriptions()
+                        except Exception:
+                            pass
+                    try:
+                        lab.bind("<Double-Button-1>", _edit_ini_desc_str)
+                    except Exception:
+                        pass
+                    r += 2
+            ini_inner.columnconfigure(0, weight=0)
+            ini_inner.columnconfigure(1, weight=1)
+            # Stash original lines for save in closure
+            ini_load._orig_lines = orig_lines  # type: ignore[attr-defined]
+
+        def ini_save():
+            p = sm_ini_var.get().strip()
+            if not p:
+                try:
+                    messagebox.showwarning("Server INI", "Select a server INI path first.")
+                except Exception:
+                    pass
+                return
+            vals: Dict[str, Any] = {}
+            for k, (var, kind) in ini_controls.items():
+                if kind == 'bool':
+                    try:
+                        vals[k] = bool(int(var.get()))
+                    except Exception:
+                        # Fallback to string
+                        vals[k] = "true" if str(var.get()) in ("1", "True", "true") else "false"
+                else:
+                    vals[k] = str(var.get())
+            orig = getattr(ini_load, "_orig_lines", None)
+            ok, msg = save_server_ini_all(p, vals, orig)
+            try:
+                if ok:
+                    messagebox.showinfo("Server INI", msg)
+                else:
+                    messagebox.showerror("Server INI", msg)
+            except Exception:
+                pass
+
+        # Action buttons and auto-load
+        ttk.Button(ini_actions, text="Load", command=ini_load).pack(side=tk.LEFT)
+        ttk.Button(ini_actions, text="Save", command=ini_save).pack(side=tk.LEFT, padx=(8,0))
+        ttk.Button(ini_actions, text="Get Public IPv4", command=ini_get_public_ipv4).pack(side=tk.LEFT, padx=(8,0))
+
+        # Auto-load Server INI if saved path exists
+        def _auto_load_ini_initial():
+            try:
+                ip = sm_ini_var.get().strip()
+                if ip and os.path.exists(ip):
+                    ini_load()
+            except Exception:
+                pass
+        try:
+            w.after(120, _auto_load_ini_initial)
+        except Exception:
+            pass
+
+    server_menu.add_command(label="Open Server Manager", command=open_server_manager_window)
 
     # Theme / Dark mode
     style = ttk.Style(root)
     original_theme = style.theme_use()
     dark_mode = tk.BooleanVar(value=False)
+
+    # Track current theme colors for use outside apply_theme
+    CURRENT_THEME: Dict[str, str] = {
+        "bg": "#f0f0f0",
+        "fg": "#000000",
+        "entry_bg": "#ffffff",
+        "selbg": "#cce6ff",
+        "status_fg": "#006400",
+        "desc_fg": "#666666",
+    }
 
     # Settings helpers for persisting preferences (e.g., dark mode)
     def read_settings() -> Dict[str, Any]:
@@ -812,11 +2514,36 @@ def build_gui():
             style.theme_use("clam")
 
         if is_dark:
-            bg = "#1e1e1e"; fg = "#e0e0e0"; acc = "#0e639c"; entry_bg = "#2d2d2d"; selbg = "#094771"
-            status_fg = "#65b665"
+            bg = "#1e1e1e"; fg = "#e0e0e0"; acc = "#0e639c"; entry_bg = "#2d2d2d"; selbg = "#094771"; status_fg = "#65b665"; desc_fg = "#9e9e9e"
         else:
-            bg = "#f0f0f0"; fg = "#000000"; acc = "#005fb8"; entry_bg = "#ffffff"; selbg = "#cce6ff"
-            status_fg = "#006400"
+            bg = "#f0f0f0"; fg = "#000000"; acc = "#005fb8"; entry_bg = "#ffffff"; selbg = "#cce6ff"; status_fg = "#006400"; desc_fg = "#666666"
+
+        # Ensure default fonts use Tahoma size 10 for consistent UI scale
+        try:
+            for fname in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkCaptionFont", "TkSmallCaptionFont", "TkIconFont", "TkTooltipFont"):
+                try:
+                    f = tkfont.nametofont(fname)
+                    f.configure(family="Tahoma", size=9)
+                except Exception:
+                    pass
+            # Keep fixed font monospace, only adjust size
+            try:
+                ffix = tkfont.nametofont("TkFixedFont")
+                ffix.configure(size=9)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # Save for other windows/widgets to reference
+        CURRENT_THEME.update({
+            "bg": bg,
+            "fg": fg,
+            "entry_bg": entry_bg,
+            "selbg": selbg,
+            "status_fg": status_fg,
+            "desc_fg": desc_fg,
+        })
 
         root.configure(background=bg)
         # Configure common ttk styles
@@ -825,6 +2552,12 @@ def build_gui():
         style.configure("TButton", padding=4)
         style.configure("TEntry", fieldbackground=entry_bg, foreground=fg)
         style.configure("TSeparator", background=bg)
+        # Labelframe styling (used in Server Manager)
+        try:
+            style.configure("TLabelframe", background=bg, foreground=fg)
+            style.configure("TLabelframe.Label", background=bg, foreground=fg)
+        except Exception:
+            pass
         # Notebook and tabs
         try:
             style.configure("TNotebook", background=bg)
@@ -842,6 +2575,12 @@ def build_gui():
         style.configure("Treeview", background=bg, fieldbackground=bg, foreground=fg, rowheight=22)
         style.map("Treeview", background=[("selected", selbg)], foreground=[("selected", fg)])
         style.configure("Treeview.Heading", background=bg, foreground=fg)
+
+        # Description labels style for SandboxVars
+        try:
+            style.configure("SandboxDesc.TLabel", background=bg, foreground=desc_fg)
+        except Exception:
+            pass
 
         # Update status label color if already created
         try:
