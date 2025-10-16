@@ -139,6 +139,85 @@
 			"problemMatcher": [
 				"$msCompile"
 			]
+		},
+		{
+			"label": "Build onefile exe",
+			"type": "shell",
+			"command": "C:/Users/FiearWilde/AppData/Local/Microsoft/WindowsApps/python3.13.exe",
+			"args": [
+				"-m",
+				"PyInstaller",
+				"--onefile",
+				"--windowed",
+				"--name",
+				"PZ-WS-to-Server",
+				"--distpath",
+				"dist",
+				"--workpath",
+				"build",
+				"pz_mod_scraper.py"
+			],
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build exe with data",
+			"type": "shell",
+			"command": "C:/Users/FiearWilde/AppData/Local/Microsoft/WindowsApps/python3.13.exe",
+			"args": [
+				"-m",
+				"PyInstaller",
+				"--onefile",
+				"--windowed",
+				"--name",
+				"Fiears PZ WS to Server",
+				"--distpath",
+				"dist",
+				"--workpath",
+				"build",
+				"--add-data",
+				"AboutInfo.txt;.",
+				"--add-data",
+				"Descriptions.json;.",
+				"--add-data",
+				"Settings.json;.",
+				"pz_mod_scraper.py"
+			],
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build exe with data",
+			"type": "shell",
+			"command": "C:/Users/FiearWilde/AppData/Local/Microsoft/WindowsApps/python3.13.exe",
+			"args": [
+				"-m",
+				"PyInstaller",
+				"--noconfirm",
+				"--onefile",
+				"--windowed",
+				"--name",
+				"Fiears PZ WS to Server",
+				"--distpath",
+				"dist",
+				"--workpath",
+				"build",
+				"--add-data",
+				"AboutInfo.txt;.",
+				"--add-data",
+				"Descriptions.json;.",
+				"--add-data",
+				"Settings.json;.",
+				"pz_mod_scraper.py"
+			],
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build"
 		}
 	]
 }
